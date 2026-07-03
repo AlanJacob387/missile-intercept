@@ -1,0 +1,18 @@
+{
+  "_meta": {
+    "note": "Fictional defended assets. Positions are local ENU metres relative to the defended origin.",
+    "frame": "east_north_up_m"
+  },
+  "cities": [
+    {
+      "name": "Asset Alpha",
+      "position_m": [0.0, 0.0, 0.0],
+      "value": 1.0
+    },
+    {
+      "name": "Asset Bravo",
+      "position_m": [25000.0, 12000.0, 0.0],
+      "value": 0.6
+    }
+  ]
+}

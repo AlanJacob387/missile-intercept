@@ -1,0 +1,10 @@
+# Radar model parameters for a generic ground-based BMD sensor.
+# Every value below is a public literature approximation used as a model input.
+# None of it is measured performance of any real system.
+# TODO: source URL
+
+sigma_range_m: 100.0     # public literature approximation. TODO: source URL
+sigma_az_deg: 0.2        # public literature approximation. TODO: source URL
+sigma_el_deg: 0.2        # public literature approximation. TODO: source URL
+detect_range_km: 400.0   # public literature approximation. TODO: source URL
+update_hz: 10.0          # public literature approximation. TODO: source URL

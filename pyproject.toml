@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mdsim"
+version = "0.0.1"
+description = "Vectorized 3D missile defense simulation"
+requires-python = ">=3.11"
+# The default PyPI torch wheel is CPU-only on Windows. Install the XPU build from
+# PyTorch's own index before `pip install -e .`, or torch.xpu will be unavailable:
+#   pip install torch --index-url https://download.pytorch.org/whl/xpu
+# Verified against docs.pytorch.org "Getting Started on Intel GPU"; torch.compile on
+# Windows XPU requires 2.7 or newer.
+dependencies = [
+    "torch>=2.7",
+    "numpy",
+    "pyyaml",
+    "matplotlib",
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# "." puts the un-installed reference oracle on the path alongside the package.
+pythonpath = ["src", "."]

@@ -1,0 +1,17 @@
+{
+  "_meta": {
+    "note": "Public literature approximations used as model inputs. Not measured performance of any real system.",
+    "source_url": "TODO"
+  },
+  "threats": {
+    "generic_srbm": {
+      "class": "SRBM",
+      "max_range_km": 300,
+      "terminal_speed_mps": 1000,
+      "maneuver_g": 0,
+      "divert_budget": 0,
+      "rcs_proxy": 1.0,
+      "payload_value": 1.0
+    }
+  }
+}

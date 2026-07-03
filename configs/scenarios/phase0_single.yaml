@@ -1,0 +1,17 @@
+# Phase 0: one threat, one interceptor, one defended asset per environment.
+#
+# Launch state is a 45-degree drag-free lob sized to fall on the origin from
+# 150 km, i.e. half the generic_srbm max range: v = sqrt(R * g) = 1213 m/s.
+
+name: phase0_single
+
+n_threats: 1
+n_interceptors: 1
+
+threat: generic_srbm
+interceptor: generic_mid_tier
+
+threat_launch_pos_m: [-150000.0, 0.0, 0.0]
+threat_launch_vel_mps: [857.6, 0.0, 857.6]
+
+battery_pos_m: [0.0, 0.0, 0.0]

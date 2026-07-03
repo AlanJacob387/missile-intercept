@@ -1,0 +1,10 @@
+# Simulation core parameters.
+#
+# device is the requested backend. If it is unavailable at runtime the resolver
+# falls back xpu -> cuda -> cpu and says so rather than failing.
+
+dt: 0.05
+n_envs: 1024
+integrator: semi_implicit
+seed: 0
+device: xpu

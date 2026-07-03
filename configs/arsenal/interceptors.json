@@ -1,0 +1,16 @@
+{
+  "_meta": {
+    "note": "Public literature approximations used as model inputs. Not measured performance of any real system.",
+    "source_url": "TODO"
+  },
+  "interceptors": {
+    "generic_mid_tier": {
+      "intercept_speed_mps": 1700,
+      "max_g": 30,
+      "envelope_range_km": [5, 60],
+      "envelope_alt_km": [1, 25],
+      "reaction_time_s": 5,
+      "inventory": 8
+    }
+  }
+}
