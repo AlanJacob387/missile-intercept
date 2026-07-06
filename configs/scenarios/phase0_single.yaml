@@ -1,17 +1,21 @@
 # Phase 0: one threat, one interceptor, one defended asset per environment.
 #
-# Launch state is a 45-degree drag-free lob sized to fall on the origin from
-# 150 km, i.e. half the generic_srbm max range: v = sqrt(R * g) = 1213 m/s.
+# The launch state is derived, not written down: mdsim.world.scenario sizes the
+# threat's speed from engagement_range_km on a drag-free flat-Earth arc and places it
+# that far uprange of the battery. Terminal speed then emerges from that launch plus
+# atmospheric drag on the entry's ballistic coefficient.
+#
+# 150 km is half the Scud-B's 300 km reach, so the shot is well inside its envelope.
 
 name: phase0_single
 
 n_threats: 1
 n_interceptors: 1
 
-threat: generic_srbm
-interceptor: generic_mid_tier
+threat: scud_b
+interceptor: pac3_mse
 
-threat_launch_pos_m: [-150000.0, 0.0, 0.0]
-threat_launch_vel_mps: [857.6, 0.0, 857.6]
+engagement_range_km: 150.0
+launch_elevation_deg: 45.0
 
 battery_pos_m: [0.0, 0.0, 0.0]

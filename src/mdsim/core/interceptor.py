@@ -21,6 +21,7 @@ class InterceptorParams:
     envelope_min_m: float
     envelope_max_m: float
     reaction_time_s: float
+    kill_radius_m: float
 
     @classmethod
     def from_spec(cls, spec: InterceptorSpec) -> InterceptorParams:
@@ -30,6 +31,7 @@ class InterceptorParams:
             envelope_min_m=spec.envelope_range_km[0] * 1000.0,
             envelope_max_m=spec.envelope_range_km[1] * 1000.0,
             reaction_time_s=spec.reaction_time_s,
+            kill_radius_m=spec.kill_radius_m,
         )
 
 

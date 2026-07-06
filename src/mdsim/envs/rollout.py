@@ -9,14 +9,13 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from mdsim.core.dynamics import PhysicsParams
 from mdsim.core.state import EnvState
-from mdsim.envs.engine import step
+from mdsim.envs.engine import EngineParams, step
 
 
 def rollout(
     state: EnvState,
-    params: PhysicsParams,
+    params: EngineParams,
     n_steps: int,
     record: bool = False,
 ) -> tuple[EnvState, Tensor | None]:

@@ -8,3 +8,22 @@ n_envs: 1024
 integrator: semi_implicit
 seed: 0
 device: xpu
+
+# Lethal radius is a property of the interceptor's warhead, not of the simulation,
+# so it lives per entry in configs/arsenal/interceptors.json.
+
+# Proportional navigation gain. The classical usable band is 3-5.
+pn_gain: 4.0
+
+# Continuous white-acceleration spectral density for the tracker, in (m/s^2)^2/Hz.
+# Read it as an unmodelled-acceleration budget: gravity is fed to the filter as a
+# known input, so q has to cover everything else the constant-velocity model omits.
+# Drag is the big one and it is NOT modelled by the tracker -- the defender does not
+# know the threat's ballistic coefficient -- and it reaches ~2.9 g late in the
+# trajectory. At q = 1.0 the filter is far too stiff to absorb that and terminal track
+# error runs to kilometres; at 25.0 it settles near 39 m.
+#
+# Sweep-selected jointly with scud_b's ballistic coefficient over q x beta; see that
+# entry's notes. Deliberately larger than the true process noise, which makes the
+# filter conservative -- see the lower-bound note in tests/test_kalman.py.
+kf_process_noise_q: 25.0

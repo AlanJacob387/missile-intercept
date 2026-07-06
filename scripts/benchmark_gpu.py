@@ -14,13 +14,12 @@ sys.path.insert(0, str(ROOT))
 import torch  # noqa: E402
 
 from mdsim.core.config import load_config, resolve_device  # noqa: E402
-from mdsim.core.dynamics import PhysicsParams  # noqa: E402
 from mdsim.core.state import make_initial  # noqa: E402
-from mdsim.envs.engine import step  # noqa: E402
+from mdsim.envs.engine import EngineParams, step  # noqa: E402
 
-# Extends past the configured n_envs on purpose: the step is a handful of elementwise
-# kernels, so the accelerator stays launch-bound until the batch is large enough to
-# cover the dispatch. Stopping at 4096 would report a loss and hide that.
+# Extends past the configured n_envs on purpose: the Phase 0 step is a handful of
+# elementwise kernels, so the accelerator stays launch-bound until the batch is large
+# enough to cover the dispatch. Stopping at 4096 would report a loss and hide that.
 BATCH_SIZES = (1, 64, 1024, 4096, 16384, 65536)
 WARMUP_STEPS = 20
 TIMED_STEPS = 200
@@ -36,7 +35,9 @@ def _synchronize(device: str) -> None:
 def measure(config, device: str, n_envs: int) -> float:
     """Steps per second for one batch size. One step advances all n_envs."""
     config = replace(config, sim=replace(config.sim, n_envs=n_envs))
-    params = PhysicsParams.from_config(config)
+    # The full loop, not physics alone: sensing and guidance are most of the step's
+    # work, so timing physics only would flatter the accelerator crossover.
+    params = EngineParams.from_config(config)
     state = make_initial(config, device)
 
     for _ in range(WARMUP_STEPS):

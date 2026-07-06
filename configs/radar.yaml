@@ -1,10 +1,23 @@
-# Radar model parameters for a generic ground-based BMD sensor.
-# Every value below is a public literature approximation used as a model input.
-# None of it is measured performance of any real system.
-# TODO: source URL
+# Radar model parameters, anchored loosely on the AN/TPY-2, the X-band radar that
+# cues THAAD. Public literature approximations used as model inputs; none of this is
+# measured performance of any real system.
+#
+# Detection anchor: https://missilethreat.csis.org/system/thaad/ states the AN/TPY-2
+# "detects and tracks enemy missiles at ranges of 870 to 3,000 km".
 
-sigma_range_m: 100.0     # public literature approximation. TODO: source URL
-sigma_az_deg: 0.2        # public literature approximation. TODO: source URL
-sigma_el_deg: 0.2        # public literature approximation. TODO: source URL
-detect_range_km: 400.0   # public literature approximation. TODO: source URL
-update_hz: 10.0          # public literature approximation. TODO: source URL
+# Measurement noise. No public source states the sigmas of any real BMD radar, so
+# these are modeling assumptions: a metre-class range channel and a fifth of a degree
+# on each angle, which is the order of magnitude a phased array of this class implies.
+# The angular terms are what dominate at long range -- 0.2 deg is 524 m of cross-range
+# error at 150 km -- and they set the terminal miss distance in Phase 0.
+sigma_range_m: 100.0     # modeling assumption, no public figure
+sigma_az_deg: 0.2        # modeling assumption, no public figure
+sigma_el_deg: 0.2        # modeling assumption, no public figure
+
+# Deliberately far below the 870-3,000 km cited above. At the engagement scales here
+# a real TPY-2 would hold every threat from launch, which removes detection as a
+# variable and makes the radar model uninteresting. 500 km keeps acquisition inside
+# the scenario without being the binding constraint.
+detect_range_km: 500.0   # conservative modeling choice, not the cited capability
+
+update_hz: 10.0          # modeling assumption, no public figure

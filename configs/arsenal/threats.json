@@ -1,17 +1,177 @@
 {
   "_meta": {
-    "note": "Public literature approximations used as model inputs. Not measured performance of any real system.",
-    "source_url": "TODO"
+    "note": "Public approximations used as model inputs. Not measured performance of any real system, and not an operational reference. Each entry lists the sources its transcribed figures came from and names the fields that are modeling assumptions instead.",
+    "terminal_speed_basis": "terminal_speed_mps is gone as an input. Launch speed is sized from max_range_km or the scenario's engagement range, and terminal speed emerges from that launch plus drag on ballistic_coefficient_beta. reference_terminal_speed_mps is kept as display metadata only, still flagged assumed: the cited pages were checked and, apart from DF-17, none of them state a speed figure of any kind.",
+    "range_basis": "Where a source gives a range band rather than a point value, this arsenal takes the upper bound and the entry's notes say so.",
+    "assumption_convention": "Fields listed in 'assumed' are modeling choices with no public source. Citations in 'sources' back the other numeric fields only.",
+    "units": "max_range_km in km, ballistic_coefficient_beta in kg/m^2, maneuver_g in g, divert_budget in arbitrary tunable units",
+    "drag_basis": "ballistic_coefficient_beta (kg/m^2) is assumed on every entry except scud_b, which is calibrated. Drag uses a = -(rho |v| / 2 beta) v against a single exponential atmosphere.",
+    "burnout_basis": "burnout_alt_km is assumed on every entry. The simulation starts at burnout, not at the pad: boost is not modelled. Per-class anchors are SRBM ~25 km, MRBM ~60 km, IRBM ~100 km, ICBM ~200 km, HGV ~30 km before glide.",
+    "calibration_convention": "Fields listed in 'calibrated' were tuned until the model reproduced an independent published observable. They are neither transcribed nor arbitrary, and no citation in 'sources' backs them."
   },
   "threats": {
-    "generic_srbm": {
+    "scud_b": {
       "class": "SRBM",
       "max_range_km": 300,
-      "terminal_speed_mps": 1000,
+      "ballistic_coefficient_beta": 4000,
+      "burnout_alt_km": 25,
+      "reference_terminal_speed_mps": 1400,
       "maneuver_g": 0,
       "divert_budget": 0,
       "rcs_proxy": 1.0,
-      "payload_value": 1.0
+      "payload_value": 1.0,
+      "assumed": [
+        "burnout_alt_km",
+        "reference_terminal_speed_mps",
+        "rcs_proxy",
+        "payload_value"
+      ],
+      "calibrated": [
+        "ballistic_coefficient_beta"
+      ],
+      "sources": [
+        "https://missilethreat.csis.org/missile/scud/"
+      ],
+      "notes": "ballistic_coefficient_beta is calibrated, not assumed: 4,000 kg/m^2 was chosen within the public 1,000-10,000 kg/m^2 band to place terminal speed inside the SRBM Mach 3-8 terminal anchor. It is not an independent estimate of this missile's ballistic coefficient. Lower values fail the anchor from below -- 1,500 gives Mach 1.5 and 3,000 gives Mach 2.8 -- because a lighter body sheds most of its speed in the lower atmosphere. Range 300 km is stated by the cited page. The page states no speed, so 1400 m/s is a class anchor, not a transcription. Unguided ballistic reentry, so maneuver_g and divert_budget are zero by class rather than by assumption. rcs_proxy 1.0 is the normalization baseline all other entries scale against; payload_value 1.0 weights every warhead equally until Phase 1 introduces asset values. reference_terminal_speed_mps is retained for display and for attacker-mode UI later; no engine code reads it. burnout_alt_km is assumed: no public source states a burnout altitude for this system, and the value is a per-class order-of-magnitude anchor. It matters more than it looks -- the simulation begins at burnout, and starting instead at sea level with full ballistic speed would apply roughly 60 g of drag at t=0, which no missile experiences. Boost is not modelled; the simulated segment is the post-boost flight that midcourse and terminal interceptors engage."
+    },
+    "iskander_m": {
+      "class": "SRBM",
+      "max_range_km": 500,
+      "ballistic_coefficient_beta": 2000,
+      "burnout_alt_km": 25,
+      "reference_terminal_speed_mps": 2100,
+      "maneuver_g": 10,
+      "divert_budget": 100,
+      "rcs_proxy": 1.0,
+      "payload_value": 1.0,
+      "assumed": [
+        "ballistic_coefficient_beta",
+        "burnout_alt_km",
+        "reference_terminal_speed_mps",
+        "maneuver_g",
+        "divert_budget",
+        "rcs_proxy",
+        "payload_value"
+      ],
+      "sources": [
+        "https://missilethreat.csis.org/missile/ss-26-2/"
+      ],
+      "notes": "The cited page gives a 400-500 km band; this entry takes the 500 km upper bound. The page states no speed. Quasi-ballistic and publicly described as maneuvering in the terminal phase, but no public figure gives the lateral-g it pulls, so the 10 g magnitude is an assumed stand-in chosen to be hard but not impossible for a 30 g interceptor. divert_budget 100 is an arbitrary tunable energy pool. ballistic_coefficient_beta is assumed: no public source states a ballistic coefficient for this system, so the value is an order-of-magnitude choice inside the 1,000-10,000 kg/m^2 band public literature gives for reentry bodies. It is the knob that decides how much the atmosphere bleeds terminal speed, and terminal speed is now emergent from it rather than configured. reference_terminal_speed_mps is retained for display and for attacker-mode UI later; no engine code reads it. burnout_alt_km is assumed: no public source states a burnout altitude for this system, and the value is a per-class order-of-magnitude anchor. It matters more than it looks -- the simulation begins at burnout, and starting instead at sea level with full ballistic speed would apply roughly 60 g of drag at t=0, which no missile experiences. Boost is not modelled; the simulated segment is the post-boost flight that midcourse and terminal interceptors engage."
+    },
+    "df21": {
+      "class": "MRBM",
+      "max_range_km": 2150,
+      "ballistic_coefficient_beta": 4000,
+      "burnout_alt_km": 60,
+      "reference_terminal_speed_mps": 3400,
+      "maneuver_g": 0,
+      "divert_budget": 0,
+      "rcs_proxy": 1.0,
+      "payload_value": 1.0,
+      "assumed": [
+        "ballistic_coefficient_beta",
+        "burnout_alt_km",
+        "reference_terminal_speed_mps",
+        "rcs_proxy",
+        "payload_value"
+      ],
+      "sources": [
+        "https://missilethreat.csis.org/missile/df-21/",
+        "https://en.wikipedia.org/wiki/DF-21"
+      ],
+      "notes": "The two sources disagree on range: CSIS states 2,150 km, while the Wikipedia infobox gives 1,770 km baseline and treats 2,150 km as extended-range potential. This entry uses the CSIS figure. Speed is assumed and should be treated with particular suspicion: 3,400 m/s is roughly Mach 10, which the Wikipedia page gives as the estimated maximum BEFORE reentry, and that same page states terminal speed falls to around Mach 2 in the denser low atmosphere. Using it as a terminal speed overstates the endgame. Modeled as a pure ballistic reentry vehicle; the maneuvering anti-ship DF-21D is deliberately not represented by this entry. ballistic_coefficient_beta is assumed: no public source states a ballistic coefficient for this system, so the value is an order-of-magnitude choice inside the 1,000-10,000 kg/m^2 band public literature gives for reentry bodies. It is the knob that decides how much the atmosphere bleeds terminal speed, and terminal speed is now emergent from it rather than configured. reference_terminal_speed_mps is retained for display and for attacker-mode UI later; no engine code reads it. burnout_alt_km is assumed: no public source states a burnout altitude for this system, and the value is a per-class order-of-magnitude anchor. It matters more than it looks -- the simulation begins at burnout, and starting instead at sea level with full ballistic speed would apply roughly 60 g of drag at t=0, which no missile experiences. Boost is not modelled; the simulated segment is the post-boost flight that midcourse and terminal interceptors engage."
+    },
+    "df26": {
+      "class": "IRBM",
+      "max_range_km": 4000,
+      "ballistic_coefficient_beta": 5000,
+      "burnout_alt_km": 100,
+      "reference_terminal_speed_mps": 4500,
+      "maneuver_g": 5,
+      "divert_budget": 100,
+      "rcs_proxy": 1.0,
+      "payload_value": 1.0,
+      "assumed": [
+        "ballistic_coefficient_beta",
+        "burnout_alt_km",
+        "reference_terminal_speed_mps",
+        "maneuver_g",
+        "divert_budget",
+        "rcs_proxy",
+        "payload_value"
+      ],
+      "sources": [
+        "https://missilethreat.csis.org/missile/dong-feng-26-df-26/"
+      ],
+      "notes": "Range 4,000 km is stated by the cited page. The page states no speed. It does describe a maneuvering reentry vehicle, but gives no lateral-g, so 5 g is an assumed magnitude, lower than the Iskander entry because a MaRV at IRBM reentry speed trades far more energy per g. ballistic_coefficient_beta is assumed: no public source states a ballistic coefficient for this system, so the value is an order-of-magnitude choice inside the 1,000-10,000 kg/m^2 band public literature gives for reentry bodies. It is the knob that decides how much the atmosphere bleeds terminal speed, and terminal speed is now emergent from it rather than configured. reference_terminal_speed_mps is retained for display and for attacker-mode UI later; no engine code reads it. burnout_alt_km is assumed: no public source states a burnout altitude for this system, and the value is a per-class order-of-magnitude anchor. It matters more than it looks -- the simulation begins at burnout, and starting instead at sea level with full ballistic speed would apply roughly 60 g of drag at t=0, which no missile experiences. Boost is not modelled; the simulated segment is the post-boost flight that midcourse and terminal interceptors engage."
+    },
+    "minuteman_iii": {
+      "class": "ICBM",
+      "max_range_km": 13000,
+      "ballistic_coefficient_beta": 8000,
+      "burnout_alt_km": 200,
+      "reference_terminal_speed_mps": 7000,
+      "maneuver_g": 0,
+      "divert_budget": 0,
+      "rcs_proxy": 1.0,
+      "payload_value": 1.0,
+      "assumed": [
+        "ballistic_coefficient_beta",
+        "burnout_alt_km",
+        "reference_terminal_speed_mps",
+        "rcs_proxy",
+        "payload_value"
+      ],
+      "sources": [
+        "https://missilethreat.csis.org/missile/minuteman-iii/"
+      ],
+      "notes": "Range 13,000 km is stated by the cited page. The page states no speed; 7,000 m/s is the widely repeated Mach 20-plus anchor for ICBM reentry vehicles and is assumed here, not transcribed. Pure ballistic reentry. ballistic_coefficient_beta is assumed: no public source states a ballistic coefficient for this system, so the value is an order-of-magnitude choice inside the 1,000-10,000 kg/m^2 band public literature gives for reentry bodies. It is the knob that decides how much the atmosphere bleeds terminal speed, and terminal speed is now emergent from it rather than configured. reference_terminal_speed_mps is retained for display and for attacker-mode UI later; no engine code reads it. burnout_alt_km is assumed: no public source states a burnout altitude for this system, and the value is a per-class order-of-magnitude anchor. It matters more than it looks -- the simulation begins at burnout, and starting instead at sea level with full ballistic speed would apply roughly 60 g of drag at t=0, which no missile experiences. Boost is not modelled; the simulated segment is the post-boost flight that midcourse and terminal interceptors engage."
+    },
+    "hwasong_15": {
+      "class": "ICBM",
+      "max_range_km": 13000,
+      "ballistic_coefficient_beta": 8000,
+      "burnout_alt_km": 200,
+      "reference_terminal_speed_mps": 7000,
+      "maneuver_g": 0,
+      "divert_budget": 0,
+      "rcs_proxy": 1.0,
+      "payload_value": 1.0,
+      "assumed": [
+        "ballistic_coefficient_beta",
+        "burnout_alt_km",
+        "reference_terminal_speed_mps",
+        "rcs_proxy",
+        "payload_value"
+      ],
+      "sources": [
+        "https://missilethreat.csis.org/missile/hwasong-15-kn-22/"
+      ],
+      "notes": "The cited page gives an 8,500-13,000 km band; this entry takes the 13,000 km upper bound, and that upper figure is itself an estimate extrapolated from lofted test flights rather than a demonstrated full-range shot. The page states no speed; 7,000 m/s uses the same assumed ICBM reentry anchor as the Minuteman III entry. ballistic_coefficient_beta is assumed: no public source states a ballistic coefficient for this system, so the value is an order-of-magnitude choice inside the 1,000-10,000 kg/m^2 band public literature gives for reentry bodies. It is the knob that decides how much the atmosphere bleeds terminal speed, and terminal speed is now emergent from it rather than configured. reference_terminal_speed_mps is retained for display and for attacker-mode UI later; no engine code reads it. burnout_alt_km is assumed: no public source states a burnout altitude for this system, and the value is a per-class order-of-magnitude anchor. It matters more than it looks -- the simulation begins at burnout, and starting instead at sea level with full ballistic speed would apply roughly 60 g of drag at t=0, which no missile experiences. Boost is not modelled; the simulated segment is the post-boost flight that midcourse and terminal interceptors engage."
+    },
+    "df17_hgv": {
+      "class": "HGV",
+      "max_range_km": 2500,
+      "ballistic_coefficient_beta": 2000,
+      "burnout_alt_km": 30,
+      "reference_terminal_speed_mps": 2500,
+      "maneuver_g": 15,
+      "divert_budget": 100,
+      "rcs_proxy": 0.5,
+      "payload_value": 1.0,
+      "assumed": [
+        "ballistic_coefficient_beta",
+        "burnout_alt_km",
+        "reference_terminal_speed_mps",
+        "maneuver_g",
+        "divert_budget",
+        "rcs_proxy",
+        "payload_value"
+      ],
+      "sources": [
+        "https://missilethreat.csis.org/missile/df-17/"
+      ],
+      "notes": "The cited page gives a 1,800-2,500 km range band; this entry takes the upper bound. It is the only page in this arsenal that prints a speed, as a Mach 5-10 glide band (1.72-3.43 km/s); 2,500 m/s sits inside that band but is an interpolation, so it stays flagged assumed. Hypersonic glide vehicle: it glides and maneuvers rather than following a ballistic arc, so this is a glide speed, not a reentry speed. The 15 g figure is assumed and is the highest in the arsenal because sustained glide maneuver is the entry's defining trait. rcs_proxy 0.5 is an assumed lower observability against the 1.0 ballistic baseline, standing in for a smaller, lower-flying body; it is a detectability weight, not a radar cross-section in m^2. ballistic_coefficient_beta is assumed: no public source states a ballistic coefficient for this system, so the value is an order-of-magnitude choice inside the 1,000-10,000 kg/m^2 band public literature gives for reentry bodies. It is the knob that decides how much the atmosphere bleeds terminal speed, and terminal speed is now emergent from it rather than configured. reference_terminal_speed_mps is retained for display and for attacker-mode UI later; no engine code reads it. burnout_alt_km is assumed: no public source states a burnout altitude for this system, and the value is a per-class order-of-magnitude anchor. It matters more than it looks -- the simulation begins at burnout, and starting instead at sea level with full ballistic speed would apply roughly 60 g of drag at t=0, which no missile experiences. Boost is not modelled; the simulated segment is the post-boost flight that midcourse and terminal interceptors engage."
     }
   }
 }

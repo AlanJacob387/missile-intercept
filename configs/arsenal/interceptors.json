@@ -1,16 +1,118 @@
 {
   "_meta": {
-    "note": "Public literature approximations used as model inputs. Not measured performance of any real system.",
-    "source_url": "TODO"
+    "note": "Public approximations used as model inputs. Not measured performance of any real system, and not an operational reference. Each entry lists the sources its transcribed figures came from and names the fields that are modeling assumptions instead.",
+    "envelope_caveat": "Published 'range' figures are engagement ranges quoted under unstated conditions -- target class, geometry, and altitude all move them. The [min, max] bands here are modeling simplifications of those public figures, and the lower bounds in particular are layer-handoff choices rather than published minima.",
+    "assumption_convention": "Fields listed in 'assumed' are modeling choices with no public source. Citations in 'sources' back the other numeric fields only.",
+    "units": "intercept_speed_mps in m/s, max_g in g, envelopes in km, reaction_time_s in s",
+    "lethality_basis": "kill_radius_m is assumed on every entry. No cited source states a lethal radius for any of these interceptors. The hit-to-kill vs blast-fragmentation split is a sourced qualitative characterization; the metre figures attached to it are not."
   },
   "interceptors": {
-    "generic_mid_tier": {
+    "pac3_mse": {
       "intercept_speed_mps": 1700,
       "max_g": 30,
-      "envelope_range_km": [5, 60],
-      "envelope_alt_km": [1, 25],
+      "envelope_range_km": [
+        3,
+        70
+      ],
+      "envelope_alt_km": [
+        0.5,
+        24
+      ],
       "reaction_time_s": 5,
-      "inventory": 8
+      "inventory": 16,
+      "kill_radius_m": 10.0,
+      "assumed": [
+        "intercept_speed_mps",
+        "max_g",
+        "reaction_time_s",
+        "inventory",
+        "kill_radius_m"
+      ],
+      "sources": [
+        "https://missilethreat.csis.org/defsys/pac-3/",
+        "https://www.armscontrol.org/factsheets/us-and-allied-ballistic-missile-defenses-asia-pacific-region",
+        "https://thedefensepost.com/2025/06/18/thaad-guide/"
+      ],
+      "notes": "Lowest layer. The 70 km ballistic engagement range and 24 km maximum altitude are stated by the Defense Post comparison; the 3 km and 0.5 km lower bounds are modeling floors, not published minima. Speed is flagged assumed: the CSIS PAC-3 page carries no specification table at all and the Defense Post page states no PAC-3 speed, so 1700 m/s is the widely repeated Mach 5 anchor rather than a transcription. max_g 30 is assumed: a terminal endoatmospheric hit-to-kill round is the most agile thing in this arsenal, but no public figure states its limit. Magazine depth is a scenario choice. kill_radius_m 10 m is assumed. PAC-3 is widely described as a hit-to-kill round, but no cited page states a lethal radius, and the CSIS PAC-3 page carries no specification text at all. 10 m is a modeling stand-in for a kinetic kill vehicle that must essentially strike the target."
+    },
+    "thaad": {
+      "intercept_speed_mps": 2800,
+      "max_g": 20,
+      "envelope_range_km": [
+        40,
+        200
+      ],
+      "envelope_alt_km": [
+        40,
+        150
+      ],
+      "reaction_time_s": 8,
+      "inventory": 8,
+      "kill_radius_m": 10.0,
+      "assumed": [
+        "max_g",
+        "reaction_time_s",
+        "inventory",
+        "kill_radius_m"
+      ],
+      "sources": [
+        "https://missilethreat.csis.org/system/thaad/",
+        "https://www.congress.gov/crs-product/IF12645",
+        "https://thedefensepost.com/2025/06/18/thaad-guide/"
+      ],
+      "notes": "Middle layer. Speed 2800 m/s (Mach 8.2) and the 150 km flight ceiling are stated by the cited sources. IMPORTANT DEVIATION: those sources give an engagement range of 150-200 km, but this entry models [40, 200] km. The 40 km lower bound is an assumed modeling choice that overlaps the PAC-3 layer so the layered-assignment problem has a real handoff region instead of a 70-150 km hole; it is not a published figure. The 40 km altitude floor is likewise an assumed layer boundary, not a citation, and it leaves a deliberate 33-40 km seam above the SM-6 ceiling. kill_radius_m 10 m is assumed. THAAD is widely described as hit-to-kill, but no cited page states a lethal radius; 10 m is the same kinetic-kill stand-in used for the other hit-to-kill entries."
+    },
+    "sm3_iia": {
+      "intercept_speed_mps": 4500,
+      "max_g": 10,
+      "envelope_range_km": [
+        100,
+        2500
+      ],
+      "envelope_alt_km": [
+        100,
+        500
+      ],
+      "reaction_time_s": 10,
+      "inventory": 4,
+      "kill_radius_m": 10.0,
+      "assumed": [
+        "max_g",
+        "envelope_alt_km",
+        "reaction_time_s",
+        "inventory",
+        "kill_radius_m"
+      ],
+      "sources": [
+        "https://missilethreat.csis.org/defsys/sm-3/"
+      ],
+      "notes": "Highest layer, exoatmospheric midcourse. The cited page states 4.5 km/s and a 2,500 km range for Block IIA, and both are transcribed from it. The page states no altitude figures at all, so the whole altitude envelope is assumed: 100 km as the conventional edge of space and 500 km as a midcourse ceiling. max_g 10 is assumed and is the lowest here because a kill vehicle in vacuum diverts on finite propellant rather than aerodynamic lift. kill_radius_m 10 m is assumed. The cited page does state that SM-3 uses a 'hit-to-kill kinetic kill vehicle', which is why this entry sits with the small-radius group, but the page states no lethal radius and 10 m is a modeling value, not a transcription."
+    },
+    "sm6": {
+      "intercept_speed_mps": 1030,
+      "max_g": 30,
+      "envelope_range_km": [
+        10,
+        370
+      ],
+      "envelope_alt_km": [
+        0.5,
+        33
+      ],
+      "reaction_time_s": 5,
+      "inventory": 12,
+      "kill_radius_m": 30.0,
+      "assumed": [
+        "max_g",
+        "envelope_alt_km",
+        "reaction_time_s",
+        "inventory",
+        "kill_radius_m"
+      ],
+      "sources": [
+        "https://missilethreat.csis.org/defsys/sm-6/"
+      ],
+      "notes": "Endoatmospheric terminal layer, sea-based. The cited page states 1.03 km/s and a 370 km range, and both are transcribed from it. The page states no altitude figure, so the altitude envelope is assumed. The 10 km range floor is a modeling minimum, not a published one. kill_radius_m 30 m is assumed and is the loosest number in this file. SM-6 carries a blast-fragmentation warhead rather than a kinetic kill vehicle, so its effective lethal radius is genuinely larger than a hit-to-kill round's, but no public figure gives it. 30 m is a modeling choice; expect Pk for this entry to be sensitive to it."
     }
   }
 }

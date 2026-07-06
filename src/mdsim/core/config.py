@@ -18,23 +18,44 @@ DEVICE_FALLBACK = ("xpu", "cuda", "cpu")
 
 # Required arsenal fields. Missing any is a config error, not a defaulted value:
 # a silently defaulted weapon parameter is indistinguishable from a modelled one.
-THREAT_FIELDS = (
-    "class",
+THREAT_NUMERIC_FIELDS = (
     "max_range_km",
-    "terminal_speed_mps",
+    "ballistic_coefficient_beta",
+    "burnout_alt_km",
     "maneuver_g",
     "divert_budget",
     "rcs_proxy",
     "payload_value",
 )
-INTERCEPTOR_FIELDS = (
+INTERCEPTOR_NUMERIC_FIELDS = (
     "intercept_speed_mps",
     "max_g",
     "envelope_range_km",
     "envelope_alt_km",
     "reaction_time_s",
     "inventory",
+    "kill_radius_m",
 )
+
+# Carried for display and for attacker-mode UI later. No engine code reads these:
+# terminal speed is emergent from the launch solution and drag, not configured.
+THREAT_REFERENCE_FIELDS = ("reference_terminal_speed_mps",)
+
+# Provenance fields, required on every arsenal entry. `assumed` names the numeric
+# fields that no public source states, so a reader can tell a transcribed figure
+# from a modeling choice without cross-checking the citations by hand.
+PROVENANCE_FIELDS = ("sources", "notes", "assumed")
+
+THREAT_FIELDS = (
+    "class",
+    *THREAT_NUMERIC_FIELDS,
+    *THREAT_REFERENCE_FIELDS,
+    *PROVENANCE_FIELDS,
+)
+INTERCEPTOR_FIELDS = (*INTERCEPTOR_NUMERIC_FIELDS, *PROVENANCE_FIELDS)
+
+# Names permitted in an entry's `assumed` list.
+THREAT_FLAGGABLE_FIELDS = (*THREAT_NUMERIC_FIELDS, *THREAT_REFERENCE_FIELDS)
 
 
 class ConfigError(ValueError):
@@ -48,6 +69,8 @@ class SimConfig:
     integrator: str
     seed: int
     device: str
+    pn_gain: float
+    kf_process_noise_q: float
 
 
 @dataclass(frozen=True)
@@ -60,15 +83,43 @@ class RadarConfig:
 
 
 @dataclass(frozen=True)
+class Provenance:
+    """Where an arsenal entry's numbers came from.
+
+    `assumed` lists numeric fields that no cited source states -- modeling choices,
+    which a citation must never be read as backing.
+
+    `calibrated` lists fields tuned until the model reproduced an independent
+    observable, such as a published terminal-speed band. Neither sourced nor
+    arbitrary, and worth separating from both: a calibrated value carries evidence,
+    but the evidence is the model's own output rather than a measurement.
+    """
+
+    sources: tuple[str, ...]
+    notes: str
+    assumed: frozenset[str]
+    calibrated: frozenset[str] = frozenset()
+
+    def is_assumed(self, field: str) -> bool:
+        return field in self.assumed
+
+    def is_unsourced(self, field: str) -> bool:
+        return field in self.assumed or field in self.calibrated
+
+
+@dataclass(frozen=True)
 class ThreatSpec:
     name: str
     missile_class: str
     max_range_km: float
-    terminal_speed_mps: float
+    ballistic_coefficient_beta: float
+    burnout_alt_km: float
+    reference_terminal_speed_mps: float
     maneuver_g: float
     divert_budget: float
     rcs_proxy: float
     payload_value: float
+    provenance: Provenance
 
 
 @dataclass(frozen=True)
@@ -80,6 +131,8 @@ class InterceptorSpec:
     envelope_alt_km: tuple[float, float]
     reaction_time_s: float
     inventory: int
+    kill_radius_m: float
+    provenance: Provenance
 
 
 @dataclass(frozen=True)
@@ -96,8 +149,8 @@ class ScenarioConfig:
     n_interceptors: int
     threat: str
     interceptor: str
-    threat_launch_pos_m: tuple[float, float, float]
-    threat_launch_vel_mps: tuple[float, float, float]
+    engagement_range_km: float
+    launch_elevation_deg: float
     battery_pos_m: tuple[float, float, float]
 
 
@@ -215,7 +268,16 @@ def _interval(value: Any, name: str, where: str) -> tuple[float, float]:
 
 
 def parse_sim(data: Mapping[str, Any]) -> SimConfig:
-    _require(data, ("dt", "n_envs", "integrator", "seed", "device"), "sim")
+    fields = (
+        "dt",
+        "n_envs",
+        "integrator",
+        "seed",
+        "device",
+        "pn_gain",
+        "kf_process_noise_q",
+    )
+    _require(data, fields, "sim")
     dt = _positive(data["dt"], "dt", "sim")
 
     n_envs = data["n_envs"]
@@ -234,7 +296,17 @@ def parse_sim(data: Mapping[str, Any]) -> SimConfig:
     if device not in DEVICES:
         raise ConfigError(f"sim: device must be one of {DEVICES}, got {device!r}")
 
-    return SimConfig(dt=dt, n_envs=n_envs, integrator=integrator, seed=seed, device=device)
+    return SimConfig(
+        dt=dt,
+        n_envs=n_envs,
+        integrator=integrator,
+        seed=seed,
+        device=device,
+        pn_gain=_positive(data["pn_gain"], "pn_gain", "sim"),
+        kf_process_noise_q=_positive(
+            data["kf_process_noise_q"], "kf_process_noise_q", "sim"
+        ),
+    )
 
 
 def parse_radar(data: Mapping[str, Any]) -> RadarConfig:
@@ -249,6 +321,65 @@ def parse_radar(data: Mapping[str, Any]) -> RadarConfig:
     return RadarConfig(**{f: _positive(data[f], f, "radar") for f in fields})
 
 
+def parse_provenance(
+    data: Mapping[str, Any], numeric_fields: tuple[str, ...], where: str
+) -> Provenance:
+    """Validate an entry's citations and assumption flags."""
+    _require(data, PROVENANCE_FIELDS, where)
+
+    raw_sources = data["sources"]
+    if not isinstance(raw_sources, list):
+        raise ConfigError(f"{where}: sources must be a list of URLs")
+    for url in raw_sources:
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            raise ConfigError(f"{where}: source is not a URL: {url!r}")
+
+    notes = data["notes"]
+    if not isinstance(notes, str) or not notes.strip():
+        raise ConfigError(f"{where}: notes must be a non-empty string")
+
+    raw_assumed = data["assumed"]
+    if not isinstance(raw_assumed, list):
+        raise ConfigError(f"{where}: assumed must be a list of field names")
+    unknown = [f for f in raw_assumed if f not in numeric_fields]
+    if unknown:
+        raise ConfigError(
+            f"{where}: assumed names non-numeric or unknown field(s): "
+            f"{', '.join(map(str, unknown))}"
+        )
+
+    raw_calibrated = data.get("calibrated", [])
+    if not isinstance(raw_calibrated, list):
+        raise ConfigError(f"{where}: calibrated must be a list of field names")
+    unknown = [f for f in raw_calibrated if f not in numeric_fields]
+    if unknown:
+        raise ConfigError(
+            f"{where}: calibrated names non-numeric or unknown field(s): "
+            f"{', '.join(map(str, unknown))}"
+        )
+
+    assumed = frozenset(raw_assumed)
+    calibrated = frozenset(raw_calibrated)
+    overlap = assumed & calibrated
+    if overlap:
+        raise ConfigError(
+            f"{where}: field(s) both assumed and calibrated: {', '.join(sorted(overlap))}"
+        )
+
+    # A transcribed figure has to be traceable. Entries whose numbers are all
+    # modeling choices are allowed to carry no citation -- what is forbidden is a
+    # sourced number with nothing to source it to.
+    if set(numeric_fields) - assumed - calibrated and not raw_sources:
+        raise ConfigError(f"{where}: non-assumed numeric fields require a source URL")
+
+    return Provenance(
+        sources=tuple(raw_sources),
+        notes=notes,
+        assumed=assumed,
+        calibrated=calibrated,
+    )
+
+
 def parse_threat(name: str, data: Mapping[str, Any]) -> ThreatSpec:
     where = f"threat '{name}'"
     _require(data, THREAT_FIELDS, where)
@@ -261,11 +392,18 @@ def parse_threat(name: str, data: Mapping[str, Any]) -> ThreatSpec:
         name=name,
         missile_class=missile_class,
         max_range_km=_positive(data["max_range_km"], "max_range_km", where),
-        terminal_speed_mps=_positive(data["terminal_speed_mps"], "terminal_speed_mps", where),
+        ballistic_coefficient_beta=_positive(
+            data["ballistic_coefficient_beta"], "ballistic_coefficient_beta", where
+        ),
+        burnout_alt_km=_positive(data["burnout_alt_km"], "burnout_alt_km", where),
+        reference_terminal_speed_mps=_positive(
+            data["reference_terminal_speed_mps"], "reference_terminal_speed_mps", where
+        ),
         maneuver_g=_non_negative(data["maneuver_g"], "maneuver_g", where),
         divert_budget=_non_negative(data["divert_budget"], "divert_budget", where),
         rcs_proxy=_positive(data["rcs_proxy"], "rcs_proxy", where),
         payload_value=_non_negative(data["payload_value"], "payload_value", where),
+        provenance=parse_provenance(data, THREAT_FLAGGABLE_FIELDS, where),
     )
 
 
@@ -285,6 +423,8 @@ def parse_interceptor(name: str, data: Mapping[str, Any]) -> InterceptorSpec:
         envelope_alt_km=_interval(data["envelope_alt_km"], "envelope_alt_km", where),
         reaction_time_s=_non_negative(data["reaction_time_s"], "reaction_time_s", where),
         inventory=inventory,
+        kill_radius_m=_positive(data["kill_radius_m"], "kill_radius_m", where),
+        provenance=parse_provenance(data, INTERCEPTOR_NUMERIC_FIELDS, where),
     )
 
 
@@ -312,8 +452,8 @@ def parse_scenario(
         "n_interceptors",
         "threat",
         "interceptor",
-        "threat_launch_pos_m",
-        "threat_launch_vel_mps",
+        "engagement_range_km",
+        "launch_elevation_deg",
         "battery_pos_m",
     )
     _require(data, fields, "scenario")
@@ -329,14 +469,31 @@ def parse_scenario(
     if data["interceptor"] not in interceptors:
         raise ConfigError(f"{where}: unknown interceptor '{data['interceptor']}'")
 
+    engagement_range_km = _positive(
+        data["engagement_range_km"], "engagement_range_km", where
+    )
+    max_range_km = threats[data["threat"]].max_range_km
+    if engagement_range_km > max_range_km:
+        raise ConfigError(
+            f"{where}: engagement_range_km {engagement_range_km} exceeds "
+            f"{data['threat']} max_range_km {max_range_km}"
+        )
+
+    elevation = data["launch_elevation_deg"]
+    if not isinstance(elevation, (int, float)) or not 0.0 < elevation < 90.0:
+        raise ConfigError(
+            f"{where}: launch_elevation_deg must be strictly between 0 and 90, "
+            f"got {elevation!r}"
+        )
+
     return ScenarioConfig(
         name=data["name"],
         n_threats=data["n_threats"],
         n_interceptors=data["n_interceptors"],
         threat=data["threat"],
         interceptor=data["interceptor"],
-        threat_launch_pos_m=_vec3(data["threat_launch_pos_m"], "threat_launch_pos_m", where),
-        threat_launch_vel_mps=_vec3(data["threat_launch_vel_mps"], "threat_launch_vel_mps", where),
+        engagement_range_km=engagement_range_km,
+        launch_elevation_deg=float(elevation),
         battery_pos_m=_vec3(data["battery_pos_m"], "battery_pos_m", where),
     )
 

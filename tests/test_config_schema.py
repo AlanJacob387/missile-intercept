@@ -34,10 +34,12 @@ def test_shipped_configs_load() -> None:
     assert config.sim.dt == 0.05
     assert config.sim.n_envs == 1024
     assert config.sim.integrator == "semi_implicit"
-    assert config.radar.detect_range_km == 400.0
+    assert config.radar.detect_range_km == 500.0
     assert config.scenario.name == "phase0_single"
+    assert config.scenario.threat == "scud_b"
+    assert config.scenario.interceptor == "pac3_mse"
     assert config.threats[config.scenario.threat].missile_class == "SRBM"
-    assert config.interceptors[config.scenario.interceptor].inventory == 8
+    assert config.interceptors[config.scenario.interceptor].inventory == 16
     assert len(config.cities) >= 1
 
 
@@ -56,17 +58,17 @@ def test_zero_dt_raises(configs: Path) -> None:
 def test_missing_threat_field_raises(configs: Path) -> None:
     path = configs / "arsenal" / "threats.json"
     data = json.loads(path.read_text(encoding="utf-8"))
-    del data["threats"]["generic_srbm"]["terminal_speed_mps"]
+    del data["threats"]["scud_b"]["ballistic_coefficient_beta"]
     path.write_text(json.dumps(data), encoding="utf-8")
 
-    with pytest.raises(ConfigError, match="terminal_speed_mps"):
+    with pytest.raises(ConfigError, match="ballistic_coefficient_beta"):
         load_config(configs)
 
 
 def test_missing_interceptor_field_raises(configs: Path) -> None:
     path = configs / "arsenal" / "interceptors.json"
     data = json.loads(path.read_text(encoding="utf-8"))
-    del data["interceptors"]["generic_mid_tier"]["reaction_time_s"]
+    del data["interceptors"]["pac3_mse"]["reaction_time_s"]
     path.write_text(json.dumps(data), encoding="utf-8")
 
     with pytest.raises(ConfigError, match="reaction_time_s"):
@@ -76,7 +78,7 @@ def test_missing_interceptor_field_raises(configs: Path) -> None:
 def test_inverted_range_envelope_raises(configs: Path) -> None:
     path = configs / "arsenal" / "interceptors.json"
     data = json.loads(path.read_text(encoding="utf-8"))
-    data["interceptors"]["generic_mid_tier"]["envelope_range_km"] = [60, 5]
+    data["interceptors"]["pac3_mse"]["envelope_range_km"] = [60, 5]
     path.write_text(json.dumps(data), encoding="utf-8")
 
     with pytest.raises(ConfigError, match="envelope_range_km min must be below max"):
@@ -86,10 +88,27 @@ def test_inverted_range_envelope_raises(configs: Path) -> None:
 def test_inverted_alt_envelope_raises(configs: Path) -> None:
     path = configs / "arsenal" / "interceptors.json"
     data = json.loads(path.read_text(encoding="utf-8"))
-    data["interceptors"]["generic_mid_tier"]["envelope_alt_km"] = [25, 25]
+    data["interceptors"]["pac3_mse"]["envelope_alt_km"] = [25, 25]
     path.write_text(json.dumps(data), encoding="utf-8")
 
     with pytest.raises(ConfigError, match="envelope_alt_km min must be below max"):
+        load_config(configs)
+
+
+def test_engagement_range_beyond_threat_reach_raises(configs: Path) -> None:
+    """A scenario cannot fly a threat further than the entry says it goes."""
+    _patch_yaml(configs / "scenarios" / "phase0_single.yaml", engagement_range_km=999.0)
+    with pytest.raises(ConfigError, match="exceeds"):
+        load_config(configs)
+
+
+@pytest.mark.parametrize("elevation", [0.0, 90.0, -10.0, 120.0])
+def test_launch_elevation_out_of_range_raises(configs: Path, elevation: float) -> None:
+    """sin(2*theta) is zero at 0 and 90 degrees, so the speed solution blows up."""
+    _patch_yaml(
+        configs / "scenarios" / "phase0_single.yaml", launch_elevation_deg=elevation
+    )
+    with pytest.raises(ConfigError, match="launch_elevation_deg"):
         load_config(configs)
 
 

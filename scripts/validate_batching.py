@@ -1,4 +1,4 @@
-"""Correctness gate: report which checks pass, fail, or await the engine."""
+"""Phase 0 gate: report which correctness checks pass, fail, or await the engine."""
 
 from __future__ import annotations
 
@@ -14,10 +14,11 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from mdsim.core.config import load_config, resolve_device  # noqa: E402
-from mdsim.core.dynamics import PhysicsParams  # noqa: E402
 from mdsim.core.rng import normal  # noqa: E402
 from mdsim.core.state import EnvState, make_initial  # noqa: E402
+from mdsim.envs.engine import EngineParams  # noqa: E402
 from mdsim.envs.rollout import rollout  # noqa: E402
+from mdsim.world.scenario import launch_state  # noqa: E402
 from reference.naive_sim import G, propagate  # noqa: E402
 
 N_STEPS = 2000
@@ -48,30 +49,40 @@ def _relative_deviation(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 def _oracle_positions(config) -> torch.Tensor:
-    positions, _ = propagate(
-        config.scenario.threat_launch_pos_m,
-        config.scenario.threat_launch_vel_mps,
-        config.sim.dt,
-        N_STEPS,
-    )
+    """Drag-free ballistic oracle, started from the same burnout state the engine uses.
+
+    `propagate` takes an explicit initial condition and models no drag, so it is fed
+    the burnout position and velocity rather than any launch vector from config --
+    those no longer exist, and the burnout state is what `make_initial` builds.
+    """
+    position, velocity = launch_state(config)
+    positions, _ = propagate(position, velocity, config.sim.dt, N_STEPS)
     return torch.from_numpy(np.ascontiguousarray(positions[1:]))
+
+
+def _physics_params(config) -> EngineParams:
+    """Physics only, and drag-free, so these checks isolate the integrator.
+
+    Sensing and interception are switched off rather than tolerated, and beta is
+    forced to zero: the oracle `propagate` models no atmosphere, so leaving the
+    entry's real beta on would compare a dragged engine against a drag-free
+    reference and read as an integrator error.
+    """
+    params = EngineParams.from_config(config, engage=False)
+    return replace(params, physics=replace(params.physics, beta=0.0))
 
 
 def _engine_positions(config, device: str, dtype: torch.dtype) -> torch.Tensor:
     state = make_initial(config, device, dtype=dtype)
-    _, trajectory = rollout(state, PhysicsParams.from_config(config), N_STEPS, record=True)
+    _, trajectory = rollout(state, _physics_params(config), N_STEPS, record=True)
     return trajectory[:, 0, 0, :].double().cpu()
 
 
 def check_oracle_determinism() -> Result:
     """The oracle arbitrates every other check, so it must be reproducible first."""
     config = _config(1)
-    args = (
-        config.scenario.threat_launch_pos_m,
-        config.scenario.threat_launch_vel_mps,
-        config.sim.dt,
-        N_STEPS,
-    )
+    position, velocity = launch_state(config)
+    args = (position, velocity, config.sim.dt, N_STEPS)
     pos_a, _ = propagate(*args)
     pos_b, _ = propagate(*args)
     deviation = float(np.max(np.abs(pos_a - pos_b)))
@@ -125,7 +136,7 @@ def check_float32_floor() -> Result:
 def check_batch_invariance() -> Result:
     """Env i alone must match env i inside a batch of 1024, with varied launch states."""
     config = _config(1024)
-    params = PhysicsParams.from_config(config)
+    params = _physics_params(config)
 
     state = make_initial(config, _DEVICE)
     shape = (state.n_threats, 3)
@@ -168,7 +179,7 @@ def main() -> int:
     results = [check() for check in CHECKS]
 
     width = max(len(r.name) for r in results)
-    print(f"\nPhysics gate  (device={_DEVICE}, T={N_STEPS})")
+    print(f"\nPhase 0 gate  (device={_DEVICE}, T={N_STEPS})")
     print("-" * (width + 44))
     for r in results:
         deviation = "-" if r.deviation is None else f"{r.deviation:.3e}"

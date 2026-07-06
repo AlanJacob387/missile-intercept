@@ -1,9 +1,33 @@
 # Missile Defense Simulation
 
-A vectorized, GPU-resident 3D interception sandbox. This stage covers the physics core:
-batched tensor dynamics over thousands of parallel environments, fixed-timestep
-integration, and batch equivalence verified against an independent reference
-implementation. Built as a student research project on public, approximate data.
+A vectorized, GPU-resident 3D interception sandbox: batched tensor physics, radar with
+noise, Kalman tracking, proportional-navigation guidance, and weapon-target assignment
+across thousands of parallel environments. Built as a student research project on
+public, approximate data.
+
+## Arsenal data
+
+Every weapon statistic in `configs/arsenal/` is a public approximation, cited per
+entry in a `sources` list. Nothing here is measured performance of any real system.
+
+Each entry also carries an `assumed` list naming the numeric fields that no cited
+source states — those are modeling choices, and no citation backs them. A separate
+`calibrated` list marks fields tuned until the model reproduced an independent
+published observable; Scud-B's ballistic coefficient is the only one, set to place
+terminal speed inside the SRBM Mach 3-8 anchor. Calibrated is not sourced: the
+evidence is the model's own output, not a measurement. This matters
+more than it might look: of the seven threat entries, the cited pages state a range
+for all of them and a speed for none, so every `terminal_speed_mps` is a class-level
+anchor rather than a transcription. Interceptor lateral-g limits, reaction times, and
+magazine depths are likewise unsourced. Where a source gives a band rather than a
+point value, the entry takes the upper bound and its `notes` say so. Published
+engagement ranges are quoted under unstated conditions, so the `[min, max]` envelope
+bands are simplifications, and several lower bounds are layer-handoff choices rather
+than published minima.
+
+The tests in `tests/test_arsenal_citations.py` enforce this structurally: a numeric
+field is covered by a citation, flagged assumed, or flagged calibrated — never none
+of the three, and never both flags at once.
 
 ## Stack
 
@@ -37,10 +61,8 @@ python scripts/validate_batching.py
 The batch-equivalence gate compares the tensor engine against an independent NumPy
 reference implementation at machine precision.
 
-`test_engine_matches_across_devices` compares CPU against the resolved accelerator; on
-a machine with no accelerator it skips, since there is nothing to compare against.
-
 ---
 
 *Educational simulation. Not a targeting aid; models no classified performance. All
-weapon statistics are published public estimates, labeled as a model.*
+weapon statistics are published public estimates, cited per entry and labeled as a
+model.*

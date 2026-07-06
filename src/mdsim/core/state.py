@@ -9,6 +9,10 @@ from torch import Tensor
 
 from mdsim.core.config import Config
 from mdsim.core.rng import env_seeds
+from mdsim.sensing.tracks import TrackState, make_empty
+from mdsim.world.scenario import launch_state
+
+_TRACK_PREFIX = "tracks."
 
 
 @dataclass(frozen=True)
@@ -19,12 +23,19 @@ class EnvState:
         threat_pos, threat_vel            [N, T, 3]
         interceptor_pos, interceptor_vel  [N, I, 3]
         threat_alive                      [N, T]
-        interceptor_alive                 [N, I]
+        threat_killed                     [N, T]   killed by an interceptor
+        interceptor_alive                 [N, I]   in flight now
+        interceptor_committed             [N, I]   launched at some point
         t                                 [N]
+        step_index                        [N]
         seed                              [N]
+        tracks                            TrackState
 
     Every field carries the leading N_envs dimension, so operations on the state are
     written batched by hand rather than mapped over a per-environment function.
+
+    `tracks` is estimate-side state and lives here only so one object carries the
+    whole simulation forward. Nothing downstream reaches through it to truth.
     """
 
     threat_pos: Tensor
@@ -32,9 +43,13 @@ class EnvState:
     interceptor_pos: Tensor
     interceptor_vel: Tensor
     threat_alive: Tensor
+    threat_killed: Tensor
     interceptor_alive: Tensor
+    interceptor_committed: Tensor
     t: Tensor
+    step_index: Tensor
     seed: Tensor
+    tracks: TrackState
 
     @property
     def n_envs(self) -> int:
@@ -54,21 +69,37 @@ class EnvState:
 
     def to(self, device: torch.device | str) -> EnvState:
         """Move every field to `device` as a unit; no field may be left behind."""
-        return replace(
-            self, **{f.name: getattr(self, f.name).to(device) for f in fields(self)}
-        )
+        moved = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            moved[f.name] = value.to(device)
+        return replace(self, **moved)
 
     def to_dict(self) -> dict[str, Tensor]:
         """Flat field mapping, for torch.save and for handoff to the renderer."""
-        return {f.name: getattr(self, f.name) for f in fields(self)}
+        flat: dict[str, Tensor] = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if isinstance(value, TrackState):
+                for name, tensor in value.to_dict().items():
+                    flat[_TRACK_PREFIX + name] = tensor
+            else:
+                flat[f.name] = value
+        return flat
 
     @classmethod
     def from_dict(cls, data: dict[str, Tensor]) -> EnvState:
-        expected = {f.name for f in fields(cls)}
+        track_data = {
+            name[len(_TRACK_PREFIX) :]: tensor
+            for name, tensor in data.items()
+            if name.startswith(_TRACK_PREFIX)
+        }
+        expected = {f.name for f in fields(cls)} - {"tracks"}
         missing = expected - data.keys()
         if missing:
             raise ValueError(f"state is missing field(s): {', '.join(sorted(missing))}")
-        return cls(**{name: data[name] for name in expected})
+        values = {name: data[name] for name in expected}
+        return cls(**values, tracks=TrackState.from_dict(track_data))
 
 
 def make_initial(
@@ -95,9 +126,15 @@ def make_initial(
 
     # expand() would alias one row of storage across all N; the engine writes into
     # these in place, so materialize real per-environment storage up front.
-    threat_pos = _vec(config.scenario.threat_launch_pos_m).expand(n, n_threats, 3)
-    threat_vel = _vec(config.scenario.threat_launch_vel_mps).expand(n, n_threats, 3)
+    # Launch state is derived from the scenario's engagement range, not written in
+    # config: terminal speed has to emerge from the flight, not be declared.
+    launch_pos, launch_vel = launch_state(config)
+    threat_pos = _vec(launch_pos).expand(n, n_threats, 3)
+    threat_vel = _vec(launch_vel).expand(n, n_threats, 3)
     battery_pos = _vec(config.scenario.battery_pos_m).expand(n, n_interceptors, 3)
+
+    false_threats = torch.zeros((n, n_threats), dtype=torch.bool, device=device)
+    false_interceptors = torch.zeros((n, n_interceptors), dtype=torch.bool, device=device)
 
     return EnvState(
         threat_pos=threat_pos.contiguous(),
@@ -107,9 +144,11 @@ def make_initial(
             (n, n_interceptors, 3), dtype=dtype, device=device
         ),
         threat_alive=torch.ones((n, n_threats), dtype=torch.bool, device=device),
-        interceptor_alive=torch.zeros(
-            (n, n_interceptors), dtype=torch.bool, device=device
-        ),
+        threat_killed=false_threats.clone(),
+        interceptor_alive=false_interceptors.clone(),
+        interceptor_committed=false_interceptors.clone(),
         t=torch.zeros((n,), dtype=dtype, device=device),
+        step_index=torch.zeros((n,), dtype=torch.int64, device=device),
         seed=env_seeds(config.sim.seed, n, device),
+        tracks=make_empty(n, n_threats, device, dtype),
     )
