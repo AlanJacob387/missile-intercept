@@ -15,6 +15,11 @@ device: xpu
 # Proportional navigation gain. The classical usable band is 3-5.
 pn_gain: 4.0
 
+# A threat within this distance of its target city counts as having reached it.
+# Wider than the interceptor kill radius by two orders of magnitude: this is a
+# city-scale footprint, not a warhead-scale one.
+city_impact_radius_m: 500.0
+
 # Continuous white-acceleration spectral density for the tracker, in (m/s^2)^2/Hz.
 # Read it as an unmodelled-acceleration budget: gravity is fed to the filter as a
 # known input, so q has to cover everything else the constant-velocity model omits.

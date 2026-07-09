@@ -71,6 +71,7 @@ class SimConfig:
     device: str
     pn_gain: float
     kf_process_noise_q: float
+    city_impact_radius_m: float
 
 
 @dataclass(frozen=True)
@@ -276,6 +277,7 @@ def parse_sim(data: Mapping[str, Any]) -> SimConfig:
         "device",
         "pn_gain",
         "kf_process_noise_q",
+        "city_impact_radius_m",
     )
     _require(data, fields, "sim")
     dt = _positive(data["dt"], "dt", "sim")
@@ -305,6 +307,9 @@ def parse_sim(data: Mapping[str, Any]) -> SimConfig:
         pn_gain=_positive(data["pn_gain"], "pn_gain", "sim"),
         kf_process_noise_q=_positive(
             data["kf_process_noise_q"], "kf_process_noise_q", "sim"
+        ),
+        city_impact_radius_m=_positive(
+            data["city_impact_radius_m"], "city_impact_radius_m", "sim"
         ),
     )
 

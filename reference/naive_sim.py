@@ -1,10 +1,13 @@
 """Un-batched NumPy oracle: deliberately slow and obvious, used to check the engine.
 
-Two independent things live here. `propagate` is the ballistic reference used by the
-physics gate, drag-free by default and optionally dragged. `run_engagement` is the
-full Phase 0 pipeline -- radar, Kalman tracker, launch decision, proportional
-navigation, interceptor motion and intercept resolution -- written as a
-single-environment loop over plain NumPy arrays.
+Three independent things live here. `propagate` is the ballistic reference used by
+the physics gate, drag-free by default and optionally dragged. `run_engagement` is
+the full engagement loop -- radar, Kalman tracker, launch decision, proportional
+navigation, interceptor motion, intercept resolution, and city impact scoring --
+written as a single-environment loop over plain NumPy arrays, generalized to T
+threats. There is one interceptor, and it always targets track slot 0: weapon-target
+assignment does not exist yet, so a raid with several threats is only ever contested
+by whichever threat happens to sit in slot 0.
 
 Threats begin at burnout, not at the pad; the caller supplies that state. The
 tracker's known-acceleration input stays gravity alone even when the truth includes
@@ -16,7 +19,9 @@ than shared is the counter-based integer hash (`_mix32`, `_bits`, `_normal`), wh
 must produce the same noise or the two implementations would be driven by different
 measurements and could not be compared at all. That hash is a pure deterministic bit
 function -- no physics, no estimation, no guidance -- so copying it leaves the
-oracle's independence intact on everything the gate actually tests.
+oracle's independence intact on everything the gate actually tests. The city impact
+test (`_reached_city`) is the same closest-approach formula the intercept test uses,
+independently written for the same reason.
 
 Tests hold the port to the original: `_bits` is asserted bit-for-bit identical, and
 the normals derived from it agree to float64 rounding. The derived values are not
@@ -167,6 +172,7 @@ class EngagementParams:
     envelope_max_m: float
     kill_radius_m: float
     initial_velocity_variance: float
+    city_impact_radius_m: float
     rho0: float = RHO0
     scale_height_m: float = SCALE_HEIGHT_M
 
@@ -329,48 +335,75 @@ def _closest_approach(dp, dv, dt):
     return float(np.linalg.norm(separation)), tau
 
 
+def _reached_city(pos_before, pos_after, target_city_pos, impact_radius_m, dt):
+    """Closest approach of this step's path to the target city, matching intercept."""
+    delta_pos = pos_before - target_city_pos
+    delta_vel = (pos_after - pos_before) / dt
+    distance, _ = _closest_approach(delta_pos, delta_vel, dt)
+    return distance <= impact_radius_m
+
+
 def run_engagement(
     params: EngagementParams,
-    pos0: np.ndarray | list[float],
-    vel0: np.ndarray | list[float],
+    threat_pos0: np.ndarray | list,
+    threat_vel0: np.ndarray | list,
+    threat_target_city: np.ndarray | list,
+    threat_active: np.ndarray | list,
+    city_pos: np.ndarray | list,
+    city_value: np.ndarray | list,
     seed: int,
     n_steps: int,
     battery_pos: np.ndarray | list[float] | None = None,
 ) -> dict[str, np.ndarray]:
-    """Run the full Phase 0 loop for one environment, one threat, one interceptor.
+    """Run the engagement loop for one environment with T threats and one round.
 
     Returns per-step histories, each with a leading axis of length n_steps holding the
-    post-step value: threat_pos [T,3], threat_vel [T,3], interceptor_pos [T,3],
-    interceptor_vel [T,3], track_x [T,6], track_P [T,6,6], track_detected [T],
-    threat_alive [T], threat_killed [T], interceptor_alive [T].
+    post-step value: threat_pos [S,T,3], threat_vel [S,T,3], interceptor_pos [S,3],
+    interceptor_vel [S,3], track_x [S,T,6], track_P [S,T,6,6], track_detected [S,T],
+    threat_alive [S,T], threat_killed [S,T], threat_leaked [S,T], interceptor_alive
+    [S], interceptor_committed [S], city_alive [S,C].
 
     The step ordering mirrors the engine exactly: threat physics, radar look with the
-    pre-increment step index, tracker predict then initiate-or-update, launch check,
-    guidance, interceptor motion, intercept resolution.
+    pre-increment step index, tracker predict then initiate-or-update, launch check
+    against track slot 0, guidance, interceptor motion, intercept resolution, impact
+    scoring.
     """
     p = params
     dt = p.dt
 
-    threat_pos = np.asarray(pos0, dtype=np.float64).copy()
-    threat_vel = np.asarray(vel0, dtype=np.float64).copy()
+    threat_pos = np.asarray(threat_pos0, dtype=np.float64).copy()
+    threat_vel = np.asarray(threat_vel0, dtype=np.float64).copy()
+    target_city = np.asarray(threat_target_city, dtype=np.int64).copy()
+    active = np.asarray(threat_active, dtype=bool).copy()
+    cities = np.asarray(city_pos, dtype=np.float64)
+    values = np.asarray(city_value, dtype=np.float64)
+
+    n_threats = threat_pos.shape[0]
+
     radar_pos = np.asarray(p.radar_pos, dtype=np.float64)
-    launch_pos = (
+    launch_origin = (
         radar_pos.copy()
         if battery_pos is None
         else np.asarray(battery_pos, dtype=np.float64)
     )
 
-    interceptor_pos = launch_pos.copy()
+    interceptor_pos = launch_origin.copy()
     interceptor_vel = np.zeros(3, dtype=np.float64)
 
-    threat_alive = True
-    threat_killed = False
+    # An inactive slot is never alive, so it never flies, is never tracked and is
+    # never scored.
+    threat_alive = active.copy()
+    threat_killed = np.zeros(n_threats, dtype=bool)
+    threat_leaked = np.zeros(n_threats, dtype=bool)
+
     interceptor_alive = False
     interceptor_committed = False
 
-    track_x = np.zeros(6, dtype=np.float64)
-    track_P = np.eye(6, dtype=np.float64)
-    track_detected = False
+    city_alive = np.ones(cities.shape[0], dtype=bool)
+
+    track_x = np.zeros((n_threats, 6), dtype=np.float64)
+    track_P = np.stack([np.eye(6, dtype=np.float64) for _ in range(n_threats)])
+    track_detected = np.zeros(n_threats, dtype=bool)
 
     seeds = np.array([seed], dtype=np.int64)
     gravity = np.array([0.0, 0.0, -p.g], dtype=np.float64)
@@ -387,69 +420,78 @@ def run_engagement(
             "track_detected",
             "threat_alive",
             "threat_killed",
+            "threat_leaked",
             "interceptor_alive",
+            "interceptor_committed",
+            "city_alive",
         )
     }
 
     for k in range(n_steps):
         threat_pos_before = threat_pos.copy()
         interceptor_pos_before = interceptor_pos.copy()
-        threat_alive_before = threat_alive
+        threat_alive_before = threat_alive.copy()
 
         # 1. Threat physics. Gravity plus drag evaluated at the old state, then
         # semi-implicit Euler. Frozen once the threat is dead.
-        accel = gravity + _drag_accel(
-            threat_pos, threat_vel, p.beta, p.rho0, p.scale_height_m
-        )
-        new_vel = threat_vel + accel * dt
-        new_pos = threat_pos + new_vel * dt
-        if threat_alive:
-            threat_pos, threat_vel = new_pos, new_vel
-
-        # 2. Radar look, using the pre-increment step index as the engine does.
-        rel = threat_pos - radar_pos
-        true_sph = _to_spherical(rel)
-        noise = np.array(
-            [
-                _normal(seeds, k, STREAM_RANGE, 1)[0, 0] * p.sigma_range_m,
-                _normal(seeds, k, STREAM_AZ, 1)[0, 0] * p.sigma_az_rad,
-                _normal(seeds, k, STREAM_EL, 1)[0, 0] * p.sigma_el_rad,
-            ],
-            dtype=np.float64,
-        )
-        measured_sph = true_sph + noise
-        measured_cart = _to_cartesian(measured_sph) + radar_pos
-
-        on_cadence = (k % p.radar_period_steps) == 0
-        in_range = true_sph[0] <= p.detect_range_m
-        detected = bool(on_cadence and in_range and threat_alive_before)
-
-        # 3. Tracker: predict every step, initiate or update on a measurement.
-        # The tracker models gravity as a known control input, as the engine does.
-        x_pred, P_pred = _kf_predict(
-            track_x, track_P, dt, p.kf_q, known_accel=gravity
-        )
-        R = _measurement_covariance(measured_sph, p)
-
-        if detected and not track_detected:
-            track_x, track_P = _kf_initialize(
-                measured_cart, R, p.initial_velocity_variance
+        for t in range(n_threats):
+            accel = gravity + _drag_accel(
+                threat_pos[t], threat_vel[t], p.beta, p.rho0, p.scale_height_m
             )
-        elif detected and track_detected:
-            track_x, track_P = _kf_update(x_pred, P_pred, measured_cart, R)
-        else:
-            track_x, track_P = x_pred, P_pred
+            new_vel = threat_vel[t] + accel * dt
+            new_pos = threat_pos[t] + new_vel * dt
+            if threat_alive[t]:
+                threat_pos[t] = new_pos
+                threat_vel[t] = new_vel
 
-        track_detected = track_detected or detected
+        # 2. Radar look, using the pre-increment step index as the engine does. One
+        # noise lane per threat slot, so the lane layout matches the batched draw.
+        noise_range = _normal(seeds, k, STREAM_RANGE, n_threats)[0]
+        noise_az = _normal(seeds, k, STREAM_AZ, n_threats)[0]
+        noise_el = _normal(seeds, k, STREAM_EL, n_threats)[0]
+        on_cadence = (k % p.radar_period_steps) == 0
 
-        # 4. Launch decision, from the track only.
+        # 3. Tracker: predict every step, initiate or update on a measurement. The
+        # tracker models gravity as a known control input, as the engine does.
+        for t in range(n_threats):
+            true_sph = _to_spherical(threat_pos[t] - radar_pos)
+            measured_sph = true_sph + np.array(
+                [
+                    noise_range[t] * p.sigma_range_m,
+                    noise_az[t] * p.sigma_az_rad,
+                    noise_el[t] * p.sigma_el_rad,
+                ],
+                dtype=np.float64,
+            )
+            measured_cart = _to_cartesian(measured_sph) + radar_pos
+
+            in_range = true_sph[0] <= p.detect_range_m
+            detected = bool(on_cadence and in_range and threat_alive_before[t])
+
+            x_pred, P_pred = _kf_predict(
+                track_x[t], track_P[t], dt, p.kf_q, known_accel=gravity
+            )
+            R = _measurement_covariance(measured_sph, p)
+
+            if detected and not track_detected[t]:
+                track_x[t], track_P[t] = _kf_initialize(
+                    measured_cart, R, p.initial_velocity_variance
+                )
+            elif detected and track_detected[t]:
+                track_x[t], track_P[t] = _kf_update(x_pred, P_pred, measured_cart, R)
+            else:
+                track_x[t], track_P[t] = x_pred, P_pred
+
+            track_detected[t] = bool(track_detected[t] or detected)
+
+        # 4. Launch decision, against track slot 0 only -- there is no assignment.
         point, feasible = _predicted_intercept(
-            track_x[:3], track_x[3:], interceptor_pos, p.interceptor_speed_mps
+            track_x[0, :3], track_x[0, 3:], interceptor_pos, p.interceptor_speed_mps
         )
         reach = float(np.linalg.norm(point - interceptor_pos))
         in_envelope = p.envelope_min_m <= reach <= p.envelope_max_m
         launch = bool(
-            track_detected and feasible and in_envelope and not interceptor_committed
+            track_detected[0] and feasible and in_envelope and not interceptor_committed
         )
 
         if launch:
@@ -461,9 +503,9 @@ def run_engagement(
 
         # 5. Guidance, then 6. interceptor motion under its limits.
         command = _pn_accel(
-            track_x[:3],
-            track_x[3:],
-            track_detected,
+            track_x[0, :3],
+            track_x[0, 3:],
+            bool(track_detected[0]),
             interceptor_pos,
             interceptor_vel,
             p.pn_gain,
@@ -477,24 +519,61 @@ def run_engagement(
         if interceptor_alive:
             interceptor_pos, interceptor_vel = moved_pos, moved_vel
 
-        # 7. Intercept resolution over the segment just flown.
-        hit = False
-        passed = False
-        if threat_alive_before and interceptor_alive:
-            dp = interceptor_pos_before - threat_pos_before
-            dv = (
-                (interceptor_pos - interceptor_pos_before)
-                - (threat_pos - threat_pos_before)
-            ) / dt
-            distance, tau = _closest_approach(dp, dv, dt)
-            hit = distance <= p.kill_radius_m
-            passed = (not hit) and (0.0 < tau < dt)
+        # 7. Intercept resolution, over EVERY threat -- not just the one the round is
+        # steered at. There is no assignment layer to scope this against, so it
+        # mirrors the engine's pairwise geometry test exactly: a hit or a fly-past
+        # against any threat resolves the round, whether or not that threat was the
+        # one the interceptor was actually chasing.
+        threat_hit = np.zeros(n_threats, dtype=bool)
+        interceptor_hit = False
+        interceptor_passed = False
 
-        if hit:
-            threat_alive = False
-            threat_killed = True
-        if hit or passed:
-            interceptor_alive = False
+        if interceptor_alive:
+            for t in range(n_threats):
+                if not threat_alive_before[t]:
+                    continue
+                dp = interceptor_pos_before - threat_pos_before[t]
+                dv = (
+                    (interceptor_pos - interceptor_pos_before)
+                    - (threat_pos[t] - threat_pos_before[t])
+                ) / dt
+                distance, tau = _closest_approach(dp, dv, dt)
+
+                if distance <= p.kill_radius_m:
+                    threat_hit[t] = True
+                    interceptor_hit = True
+                elif 0.0 < tau < dt:
+                    interceptor_passed = True
+
+        threat_killed = threat_killed | threat_hit
+        survived = threat_alive_before & ~threat_hit
+
+        # 8. Impact scoring. Binary: the first threat to reach a city destroys it.
+        newly_leaked = np.zeros(n_threats, dtype=bool)
+        city_hit = np.zeros(cities.shape[0], dtype=bool)
+        for t in range(n_threats):
+            if not (active[t] and survived[t] and not threat_leaked[t]):
+                continue
+            if _reached_city(
+                threat_pos_before[t],
+                threat_pos[t],
+                cities[int(target_city[t])],
+                p.city_impact_radius_m,
+                dt,
+            ):
+                newly_leaked[t] = True
+                city_hit[int(target_city[t])] = True
+
+        destroyed = city_hit & city_alive
+
+        # A threat below ground is down, whether or not it landed on anything.
+        grounded = threat_pos[:, 2] < 0.0
+
+        interceptor_alive = interceptor_alive and not (interceptor_hit or interceptor_passed)
+
+        threat_alive = survived & ~newly_leaked & ~grounded
+        threat_leaked = threat_leaked | newly_leaked
+        city_alive = city_alive & ~destroyed
 
         history["threat_pos"].append(threat_pos.copy())
         history["threat_vel"].append(threat_vel.copy())
@@ -502,9 +581,12 @@ def run_engagement(
         history["interceptor_vel"].append(interceptor_vel.copy())
         history["track_x"].append(track_x.copy())
         history["track_P"].append(track_P.copy())
-        history["track_detected"].append(track_detected)
-        history["threat_alive"].append(threat_alive)
-        history["threat_killed"].append(threat_killed)
+        history["track_detected"].append(track_detected.copy())
+        history["threat_alive"].append(threat_alive.copy())
+        history["threat_killed"].append(threat_killed.copy())
+        history["threat_leaked"].append(threat_leaked.copy())
         history["interceptor_alive"].append(interceptor_alive)
+        history["interceptor_committed"].append(interceptor_committed)
+        history["city_alive"].append(city_alive.copy())
 
     return {key: np.asarray(values) for key, values in history.items()}

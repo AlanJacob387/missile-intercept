@@ -5,8 +5,12 @@ environments so the whole step compiles to device work. Compilation is applied i
 later task -- eager first, once parity with the oracle holds.
 
 Order within a tick: threat physics, radar look, tracker predict and update, launch
-decision, guidance, interceptor motion, intercept resolution. The tracker sees the
-post-move truth, and guidance sees only what the tracker produced.
+decision, guidance, interceptor motion, intercept resolution, impact scoring. The
+tracker sees the post-move truth, and guidance sees only what the tracker produced.
+
+Every interceptor still defaults to track slot 0 -- there is no weapon-target
+assignment yet, so a raid with several threats is only ever contested by whichever
+interceptor slots exist, all aimed at the same track.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from mdsim.guidance.launch import should_launch
 from mdsim.guidance.pro_nav import pn_accel
 from mdsim.sensing import kalman, radar
 from mdsim.sensing.tracks import TrackState
+from mdsim.world import damage
 
 # A single position fix carries no velocity information, so the track opens with a
 # deliberately wide velocity block, in (m/s)^2.
@@ -47,6 +52,7 @@ class EngineParams:
     kf_q: float
     pn_gain: float
     interceptor: interceptor_mod.InterceptorParams
+    city_impact_radius_m: float
     engage: bool = True
 
     @classmethod
@@ -72,6 +78,7 @@ class EngineParams:
             kf_q=config.sim.kf_process_noise_q,
             pn_gain=config.sim.pn_gain,
             interceptor=interceptor_mod.InterceptorParams.from_spec(spec),
+            city_impact_radius_m=config.sim.city_impact_radius_m,
             engage=engage,
         )
 
@@ -214,8 +221,8 @@ def step(state: EnvState, params: EngineParams) -> EnvState:
         state.threat_alive,
         interceptor_alive,
         dt,
-        # Per interceptor, [I]: lethal radius belongs to the warhead. Phase 0 flies
-        # one type per battery, so every slot carries the same value today.
+        # Per interceptor, [I]: lethal radius belongs to the warhead. One type per
+        # battery, so every slot carries the same value today.
         torch.full(
             (state.n_interceptors,),
             params.interceptor.kill_radius_m,
@@ -226,21 +233,51 @@ def step(state: EnvState, params: EngineParams) -> EnvState:
 
     threat_hit = hit.any(dim=2)
     interceptor_hit = hit.any(dim=1)
+    # Unscoped: every interceptor targets slot 0, so there is only one thing a round
+    # could have flown past. Scoping this to an assignment is an engagement-layer
+    # concern.
     interceptor_passed = passed.any(dim=1)
 
-    return EnvState(
+    threat_killed = state.threat_killed | threat_hit
+    survived = state.threat_alive & ~threat_hit
+
+    newly_leaked, destroyed = damage.resolve_leaks(
+        state.threat_pos,
+        threat_pos,
+        state.threat_target_city,
+        state.threat_active,
+        survived,
+        state.threat_leaked,
+        state.city_pos,
+        state.city_alive,
+        params.city_impact_radius_m,
+        dt,
+    )
+
+    # A threat below ground is down, whether or not it landed on anything. Without
+    # this a threat that misses every city keeps flying underground forever, holding
+    # the run open and never resolving.
+    grounded = threat_pos[..., 2] < 0.0
+
+    # A miss ends the round for that interceptor: closest approach fell inside the
+    # step and it did not kill, so it has flown past and is spent.
+    interceptor_alive = interceptor_alive & ~interceptor_hit & ~interceptor_passed
+
+    # replace() rather than a field-by-field rebuild: a new state field would
+    # otherwise have to be threaded through every return site or be silently dropped.
+    return replace(
+        state,
         threat_pos=threat_pos,
         threat_vel=threat_vel,
         interceptor_pos=interceptor_pos,
         interceptor_vel=interceptor_vel,
-        threat_alive=state.threat_alive & ~threat_hit,
-        threat_killed=state.threat_killed | threat_hit,
-        # A miss ends the round for that interceptor: closest approach fell inside
-        # the step and it did not kill, so it has flown past and is spent.
-        interceptor_alive=interceptor_alive & ~interceptor_hit & ~interceptor_passed,
+        threat_alive=survived & ~newly_leaked & ~grounded,
+        threat_killed=threat_killed,
+        threat_leaked=state.threat_leaked | newly_leaked,
+        interceptor_alive=interceptor_alive,
         interceptor_committed=interceptor_committed,
+        city_alive=state.city_alive & ~destroyed,
         t=state.t + dt,
         step_index=step_index,
-        seed=state.seed,
         tracks=tracks,
     )

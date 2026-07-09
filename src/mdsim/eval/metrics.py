@@ -1,4 +1,10 @@
-"""Kill probability, leakage, expenditure counts, and value-weighted damage."""
+"""Kill probability, leakage, expenditure counts, and value-weighted damage.
+
+Every threat-side metric is masked by `threat_active`. Threat slots are fixed at T
+and a raid uses only the first few, so an unmasked mean divides by the slot count
+rather than the raid size and reports a smaller leakage the emptier the raid gets --
+exactly backwards, and exactly the shape a saturation curve is supposed to show.
+"""
 
 from __future__ import annotations
 
@@ -9,14 +15,54 @@ from mdsim.core.state import EnvState
 _ACC = torch.float64  # reduce in float64 so a 4096-env mean is not float32-noisy
 
 
+def _active_count(state: EnvState) -> torch.Tensor:
+    """Active threat slots per env, [N], clamped so empty raids cannot divide by zero."""
+    return state.threat_active.to(_ACC).sum(dim=1).clamp(min=1.0)
+
+
 def kill_probability(state: EnvState) -> float:
-    """Fraction of environments in which every threat was killed."""
-    return float(state.threat_killed.all(dim=1).to(_ACC).mean())
+    """Fraction of environments in which every active threat was killed."""
+    unkilled = state.threat_active & ~state.threat_killed
+    return float((~unkilled.any(dim=1)).to(_ACC).mean())
 
 
 def leakage(state: EnvState) -> float:
-    """Fraction of all threats that were not killed."""
-    return float((~state.threat_killed).to(_ACC).mean())
+    """Fraction of active threats that reached their city.
+
+    Leakage is what got through, not merely what went unkilled: a threat still in
+    flight when the run ends is neither. The saturation curve is drawn from this.
+    """
+    leaked = (state.threat_leaked & state.threat_active).to(_ACC).sum(dim=1)
+    return float((leaked / _active_count(state)).mean())
+
+
+def leaked_count(state: EnvState) -> float:
+    """Total active threats that reached a city, across the batch."""
+    return float((state.threat_leaked & state.threat_active).to(_ACC).sum())
+
+
+def value_destroyed(state: EnvState) -> float:
+    """Mean per-env city value lost. Destruction is binary per city."""
+    lost = (~state.city_alive).to(_ACC) * state.city_value.to(_ACC)
+    return float(lost.sum(dim=1).mean())
+
+
+def value_defended(state: EnvState) -> float:
+    """Mean per-env city value still standing."""
+    held = state.city_alive.to(_ACC) * state.city_value.to(_ACC)
+    return float(held.sum(dim=1).mean())
+
+
+def damage_prevented_fraction(state: EnvState) -> float:
+    """Share of total city value still standing, in [0, 1].
+
+    The defended fraction rather than an absolute, so runs with different city sets
+    stay comparable.
+    """
+    total = float(state.city_value.to(_ACC).sum(dim=1).mean())
+    if total == 0.0:
+        return 1.0
+    return value_defended(state) / total
 
 
 def interceptors_committed(state: EnvState) -> float:
@@ -25,8 +71,8 @@ def interceptors_committed(state: EnvState) -> float:
 
 
 def kills(state: EnvState) -> float:
-    """Total threats killed across the whole batch. A count, not a rate."""
-    return float(state.threat_killed.to(_ACC).sum())
+    """Total active threats killed across the whole batch. A count, not a rate."""
+    return float((state.threat_killed & state.threat_active).to(_ACC).sum())
 
 
 def committed_per_kill(state: EnvState) -> float | None:
@@ -36,10 +82,8 @@ def committed_per_kill(state: EnvState) -> float | None:
     not infinite, and not zero. Callers must render the absence rather than let a
     sentinel float propagate into a plot or a table.
 
-    This is a batch aggregate, NOT a salvo size. With one interceptor committed per
-    environment it is simply 1/Pk, so at Pk = 0.05 it reads 20 by construction and
-    says nothing about how many rounds any single engagement fired. Read it beside
-    the raw counts, never instead of them.
+    This is a batch aggregate, NOT a salvo size. Read it beside the raw counts,
+    never instead of them.
     """
     killed = kills(state)
     if killed == 0.0:
@@ -48,12 +92,13 @@ def committed_per_kill(state: EnvState) -> float | None:
 
 
 def tracks_held(state: EnvState) -> float:
-    """Fraction of threats the tracker was still holding at the end of the run.
+    """Fraction of active threats the tracker was still holding at the end.
 
     Not a scoring metric. It separates a miss from a never-detected threat, which is
-    the first thing to check when Pk collapses.
+    the first thing to check when leakage is total.
     """
-    return float(state.tracks.detected.to(_ACC).mean())
+    held = (state.tracks.detected & state.threat_active).to(_ACC).sum(dim=1)
+    return float((held / _active_count(state)).mean())
 
 
 def summarize(state: EnvState) -> dict[str, float | None]:
@@ -61,6 +106,9 @@ def summarize(state: EnvState) -> dict[str, float | None]:
     return {
         "pk": kill_probability(state),
         "leakage": leakage(state),
+        "leaked_count": leaked_count(state),
+        "value_destroyed": value_destroyed(state),
+        "damage_prevented_fraction": damage_prevented_fraction(state),
         "interceptors_committed": interceptors_committed(state),
         "kills": kills(state),
         "committed_per_kill_batch_level": committed_per_kill(state),

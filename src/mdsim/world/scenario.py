@@ -34,7 +34,13 @@ SCALE_HEIGHT_M = 8500.0
 # the root-find targets -- the sized speed would miss by more than the tolerance it
 # was solved to.
 SIZING_DT_S = 0.05
-RANGE_TOLERANCE = 0.01
+
+# The sized trajectory has to land inside the target it is aimed at, so this bound is
+# coupled to sim.city_impact_radius_m: at a 150 km engagement range, 1% is 1,500 m
+# against a 500 m city footprint, and a threat sized to that tolerance can be aimed
+# correctly and still miss every time. 0.1% puts the sizing error a factor of three
+# inside the footprint. Bisection pays a handful of extra halvings for it.
+RANGE_TOLERANCE = 0.001
 MAX_BISECTION_STEPS = 60
 
 
@@ -201,6 +207,68 @@ def launch_state(
     )
     velocity = (speed * math.cos(theta), 0.0, speed * math.sin(theta))
     return position, velocity
+
+
+def multi_launch_state(
+    config: Config, n_threats: int, bearing_spread_deg: float = 40.0
+) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]], list[int]]:
+    """Burnout states for a raid, plus the city each threat is aimed at.
+
+    Returns (positions, velocities, target_city_index), each of length n_threats.
+
+    Threat t is assigned city t % n_cities round-robin, then placed one engagement
+    range uprange of that city along a bearing drawn from an arc centred on -x. The
+    arc keeps a raid from collapsing onto a single line, which would make the
+    assignment problem degenerate: identical geometry means identical priority, and
+    greedy would be picking between indistinguishable targets.
+
+    Speed sizing is the same root-find the single-threat case uses, so a raid is a
+    set of independently valid Phase 0 shots rather than a new trajectory model.
+    """
+    if n_threats < 1:
+        raise ValueError(f"n_threats must be >= 1, got {n_threats}")
+
+    spec = config.threats[config.scenario.threat]
+    speed = size_burnout_speed(
+        config.scenario.engagement_range_km,
+        config.scenario.launch_elevation_deg,
+        spec.burnout_alt_km,
+        spec.ballistic_coefficient_beta,
+        spec.name,
+        config.sim.dt,
+    )
+    theta = math.radians(config.scenario.launch_elevation_deg)
+    reach = config.scenario.engagement_range_km * 1000.0
+    burnout_z = spec.burnout_alt_km * 1000.0
+
+    n_cities = len(config.cities)
+    positions: list[tuple[float, float, float]] = []
+    velocities: list[tuple[float, float, float]] = []
+    targets: list[int] = []
+
+    for index in range(n_threats):
+        city = config.cities[index % n_cities]
+        # Single threat flies straight down the -x axis, matching Phase 0 exactly.
+        if n_threats == 1:
+            bearing = 0.0
+        else:
+            span = math.radians(bearing_spread_deg)
+            bearing = -span / 2.0 + span * index / (n_threats - 1)
+
+        # Offset points from the city back along the inbound bearing.
+        offset_x = -reach * math.cos(bearing)
+        offset_y = -reach * math.sin(bearing)
+        city_x, city_y, city_z = city.position_m
+
+        positions.append((city_x + offset_x, city_y + offset_y, city_z + burnout_z))
+        horizontal = speed * math.cos(theta)
+        velocities.append(
+            (horizontal * math.cos(bearing), horizontal * math.sin(bearing),
+             speed * math.sin(theta))
+        )
+        targets.append(index % n_cities)
+
+    return positions, velocities, targets
 
 
 def threat_beta(config: Config) -> float:
