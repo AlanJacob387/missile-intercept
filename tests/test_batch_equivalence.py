@@ -1,4 +1,4 @@
-"""The correctness gate: batched engine must agree with the reference oracle."""
+"""The Phase 0 correctness gate: batched engine must agree with the reference oracle."""
 
 from __future__ import annotations
 
@@ -45,25 +45,27 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 # stays airborne for ~235 s and this horizon sits comfortably mid-flight.
 N_STEPS = 2000
 
-# The full-loop check needs a longer horizon than the physics one. There is no
-# weapon-target assignment yet, so the single interceptor launches on range alone,
-# around step 1830 -- the same order of steps Phase 0 needed. The raid case is the
-# long pole: threats never engaged by the sole interceptor have nothing to stop them,
-# so the horizon has to cover the full unpowered flight to ground, which resolves
-# near step 4110.
-FULL_LOOP_STEPS = 4200
+# The full-loop check needs a longer horizon than the physics one. Nothing enters the
+# launch envelope until the threat descends through the interceptor's 24 km ceiling
+# around step 3340, and impacts land near step 4150, so a short run would compare radar
+# and tracker while never touching assignment, launch, guidance or the intercept test.
+# The assertions below fail loudly rather than quietly skipping that half of the loop.
+FULL_LOOP_STEPS = 4400
 
 # Both parity seeds are named explicitly rather than relying on the default. Whether
 # a given seed kills depends on the tracker tuning and the ballistic coefficient, so a
 # seed that misses today can start killing after a retune -- which would silently turn
-# this into a second kill case and test nothing new.
+# this into a second kill case and test nothing new. Re-pick with the recipe
+# documented above KILLING_SEED.
 MISS_SEED = 1
 
-# The raid parity case: several threats, one interceptor, which always targets track
-# slot 0. Threats 1 and 2 are never engaged and are expected to leak, exercising
-# damage and city scoring end to end alongside the single contested engagement.
+# The raid parity case. Fewer rounds than threats, so the run exercises the magazine
+# running dry as well as the assignment itself: with a round for every threat the
+# greedy solver never has to choose.
 RAID_SEED = 0
 RAID_THREATS = 3
+RAID_INTERCEPTORS = 3
+RAID_INVENTORY = 2
 
 # Env-to-env spread for the batch-invariance check. Identical rows would pass
 # trivially, so each env gets its own launch state from the counter-based RNG.
@@ -102,8 +104,8 @@ def _burnout_states(config, n_threats: int):
     config resolution -- a root-find over the scenario's engagement range -- not
     physics, and both sides must start from bit-identical initial conditions or the
     parity comparison measures nothing. Everything the gate actually tests (drag,
-    integration, radar, tracking, guidance, intercept, impact scoring) stays
-    independently implemented in reference/naive_sim.py.
+    integration, radar, tracking, prioritisation, assignment, guidance, intercept,
+    impact scoring) stays independently implemented in reference/naive_sim.py.
     """
     return multi_launch_state(config, n_threats)
 
@@ -298,7 +300,7 @@ def test_reference_self_consistency() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Full loop: radar -> Kalman -> launch -> PN -> interceptor -> intercept -> impact
+# Full Phase 0 loop: radar -> Kalman -> launch -> PN -> interceptor -> intercept
 # ---------------------------------------------------------------------------
 
 
@@ -320,36 +322,38 @@ def _oracle_params(params: EngineParams) -> EngagementParams:
         interceptor_max_accel_mps2=params.interceptor.max_accel_mps2,
         envelope_min_m=params.interceptor.envelope_min_m,
         envelope_max_m=params.interceptor.envelope_max_m,
+        envelope_alt_min_m=params.interceptor.envelope_alt_min_m,
+        envelope_alt_max_m=params.interceptor.envelope_alt_max_m,
         kill_radius_m=params.interceptor.kill_radius_m,
         initial_velocity_variance=INITIAL_VELOCITY_VARIANCE,
+        decision_interval_steps=params.decision_interval_steps,
         city_impact_radius_m=params.city_impact_radius_m,
         rho0=params.physics.rho0,
         scale_height_m=params.physics.scale_height_m,
     )
 
 
-# Fields recorded per step. Floats are compared with a relative deviation; the boolean
-# ones are compared exactly, because a threat's status is a discrete decision and
-# "close" is not a meaningful thing for it to be.
+# Fields recorded per step. Floats are compared with a relative deviation; the integer
+# and boolean ones are compared exactly, because assignment and magazine state are
+# discrete decisions and "close" is not a meaningful thing for them to be.
 _FLOAT_FIELDS = ("threat_pos", "interceptor_pos", "track_x", "track_P")
 _EXACT_FIELDS = (
     "threat_alive",
     "threat_killed",
     "threat_leaked",
+    "track_detected",
     "interceptor_alive",
     "interceptor_committed",
+    "interceptor_target",
     "city_alive",
 )
 
 
 def _engine_history(
-    config, params: EngineParams, n_steps: int
+    config, params: EngineParams, n_steps: int, inventory: int | None = None
 ) -> dict[str, torch.Tensor]:
-    """Run the engine at N=1 in float64, recording every field the oracle returns.
-
-    There is exactly one interceptor, so its fields are read from slot 0.
-    """
-    state = make_initial(config, "cpu", dtype=torch.float64)
+    """Run the engine at N=1 in float64, recording every field the oracle returns."""
+    state = make_initial(config, "cpu", dtype=torch.float64, inventory=inventory)
 
     frames: dict[str, list[torch.Tensor]] = {
         key: [] for key in _FLOAT_FIELDS + _EXACT_FIELDS
@@ -358,22 +362,38 @@ def _engine_history(
     for _ in range(n_steps):
         state = step(state, params)
         frames["threat_pos"].append(state.threat_pos[0].clone())
-        frames["interceptor_pos"].append(state.interceptor_pos[0, 0].clone())
+        frames["interceptor_pos"].append(state.interceptor_pos[0].clone())
         frames["track_x"].append(state.tracks.x_est[0].clone())
         frames["track_P"].append(state.tracks.P[0].clone())
         frames["threat_alive"].append(state.threat_alive[0].clone())
         frames["threat_killed"].append(state.threat_killed[0].clone())
         frames["threat_leaked"].append(state.threat_leaked[0].clone())
-        frames["interceptor_alive"].append(state.interceptor_alive[0, 0].clone())
-        frames["interceptor_committed"].append(state.interceptor_committed[0, 0].clone())
+        frames["track_detected"].append(state.tracks.detected[0].clone())
+        frames["interceptor_alive"].append(state.interceptor_alive[0].clone())
+        frames["interceptor_committed"].append(state.interceptor_committed[0].clone())
+        frames["interceptor_target"].append(state.interceptor_target[0].clone())
         frames["city_alive"].append(state.city_alive[0].clone())
 
     return {key: torch.stack(values) for key, values in frames.items()}
 
 
-def _oracle_history(config, params: EngineParams, n_steps: int, n_active: int | None = None):
-    """Run the oracle from the same resolved initial conditions the engine uses."""
+def _oracle_history(
+    config,
+    params: EngineParams,
+    n_steps: int,
+    inventory: int,
+    n_active: int | None = None,
+):
+    """Run the oracle from the same resolved initial conditions the engine uses.
+
+    Mirrors make_initial's padding: geometry is built for the ACTIVE raid size and
+    inactive slots are parked on the last active launch point. Building it for the
+    slot count instead would spread a small raid differently on the two sides and the
+    comparison would fail for a reason that has nothing to do with the engagement.
+    """
     n_threats = config.scenario.n_threats
+    n_interceptors = config.scenario.n_interceptors
+
     active_count = n_threats if n_active is None else n_active
     active = max(active_count, 1)
 
@@ -384,12 +404,15 @@ def _oracle_history(config, params: EngineParams, n_steps: int, n_active: int | 
         velocities = list(velocities) + [velocities[-1]] * pad
         targets = list(targets) + [targets[-1]] * pad
 
+    enabled = [index < inventory for index in range(n_interceptors)]
+
     return run_engagement(
         _oracle_params(params),
         positions,
         velocities,
         targets,
         [index < active_count for index in range(n_threats)],
+        enabled,
         [city.position_m for city in config.cities],
         [city.value for city in config.cities],
         config.sim.seed,
@@ -424,13 +447,17 @@ def _first_true(flags) -> int | None:
     return int(indices[0]) if indices.size else None
 
 
-def _raid_config(seed: int, n_threats: int):
-    """A one-environment, one-interceptor raid scenario at a given seed."""
+def _raid_config(seed: int, n_threats: int, n_interceptors: int):
+    """A one-environment raid scenario at a given seed."""
     config = load_config(CONFIG_DIR)
     return replace(
         config,
         sim=replace(config.sim, n_envs=1, seed=seed),
-        scenario=replace(config.scenario, n_threats=n_threats, n_interceptors=1),
+        scenario=replace(
+            config.scenario,
+            n_threats=n_threats,
+            n_interceptors=n_interceptors,
+        ),
     )
 
 
@@ -438,13 +465,16 @@ def test_full_loop_engine_vs_oracle() -> None:
     """A multi-threat raid must match the oracle step for step, covariance included.
 
     Position parity alone would not catch a wrong measurement covariance: R only
-    reaches the trajectory through the Kalman gain, so P is compared directly.
+    reaches the trajectory through the Kalman gain, so P is compared directly. The
+    discrete fields -- magazine state and the assignment itself -- are compared
+    exactly, so a prioritisation or tie-break disagreement fails here rather than
+    showing up later as an unexplained trajectory drift.
     """
-    config = _raid_config(RAID_SEED, RAID_THREATS)
+    config = _raid_config(RAID_SEED, RAID_THREATS, RAID_INTERCEPTORS)
     params = EngineParams.from_config(config, engage=True)
 
-    engine = _engine_history(config, params, FULL_LOOP_STEPS)
-    oracle = _oracle_history(config, params, FULL_LOOP_STEPS)
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=RAID_INVENTORY)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, RAID_INVENTORY)
 
     deviations = _compare(engine, oracle)
     report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
@@ -454,23 +484,32 @@ def test_full_loop_engine_vs_oracle() -> None:
         assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
 
     # Without these the comparison could pass while only ever exercising radar and the
-    # tracker: nothing reaches the launch envelope until late in the flight, and with
-    # no assignment the unengaged threats have to actually leak.
-    committed = bool(engine["interceptor_committed"][-1])
+    # tracker: nothing reaches the launch envelope until late in the flight.
+    committed = int(engine["interceptor_committed"][-1].sum())
+    bound_ever = int((engine["interceptor_target"] >= 0).any(dim=0).sum())
     leaked = int(engine["threat_leaked"][-1].sum())
     killed = int(engine["threat_killed"][-1].sum())
-    print(f"raid outcome: committed={committed} killed={killed} leaked={leaked}")
-    assert committed, "the single interceptor never launched"
-    assert leaked > 0, "an unengaged threat never leaked"
+    print(
+        f"raid outcome: committed={committed} bound_ever={bound_ever} "
+        f"killed={killed} leaked={leaked}"
+    )
+    assert committed > 0, "no round ever launched"
+    assert bound_ever > 1, "assignment never bound more than one interceptor"
+    assert killed + leaked > 0, "the raid never resolved"
 
 
 def test_single_threat_regression() -> None:
-    """One threat and one round must still behave as a single engagement, end to end."""
-    config = _raid_config(MISS_SEED, 1)
+    """One threat and one round must still behave as a single engagement, end to end.
+
+    The launch STEP moved when the altitude envelope arrived, so this asserts
+    engine-oracle agreement rather than a remembered step number -- a constant would
+    only record whatever the engine happens to do today.
+    """
+    config = _raid_config(MISS_SEED, 1, 1)
     params = EngineParams.from_config(config, engage=True)
 
-    engine = _engine_history(config, params, FULL_LOOP_STEPS)
-    oracle = _oracle_history(config, params, FULL_LOOP_STEPS)
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=1)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 1)
 
     deviations = _compare(engine, oracle)
     report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
@@ -479,12 +518,13 @@ def test_single_threat_regression() -> None:
     for name, deviation in deviations.items():
         assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
 
-    assert bool(engine["interceptor_committed"][-1]), "interceptor never launched"
+    assert bool(engine["interceptor_committed"][-1, 0]), "interceptor never launched"
 
     # This seed misses, so the run also covers the `passed` transition: the round's
     # closest approach falls inside a step, it fails to kill, and it is retired.
     spent = _first_true(
-        ~engine["interceptor_alive"].numpy() & engine["interceptor_committed"].numpy()
+        ~engine["interceptor_alive"][:, 0].numpy()
+        & engine["interceptor_committed"][:, 0].numpy()
     )
     print(f"miss case: round retired at step {spent}")
     assert spent is not None, "the miss case never retired the round"
@@ -495,22 +535,27 @@ def test_single_threat_regression() -> None:
 # intercept resolution -- closest_approach, the hit branch, and the alive/killed
 # transitions -- would never be compared against the oracle at all.
 #
-# THIS CONSTANT IS TRAJECTORY-DEPENDENT and must be re-picked whenever the scenario's
-# interceptor entry, the threat's flight, or the physics change.
+# THIS CONSTANT IS ENVELOPE- AND TRAJECTORY-DEPENDENT and must be re-picked whenever
+# the scenario's interceptor entry, the threat's flight, or the physics change. It has
+# broken three times: when phase0_single moved from `generic_mid_tier` ([5, 60] km) to
+# `pac3_mse` ([3, 70] km), when threats moved to a burnout initial condition with
+# atmospheric drag, and when the engagement layer added the altitude envelope, which
+# pushed launch several hundred steps later.
 #
-# To re-pick: run a batched N=256 float64 single-threat engagement, roll until the
-# round is spent, read `threat_killed[:, 0]`, and take any env index (env i carries
-# seed base_seed + i).
-KILLING_SEED = 0
+# To re-pick: run a batched N=256 float64 engagement at one threat and one round, roll
+# until the rounds are spent, read `threat_killed[:, 0]`, and take any env index (env i
+# carries seed base_seed + i). The killing rate has swung between 1-in-256 and 1-in-3
+# across retunings, so scan a wide batch rather than assuming an early index will do.
+KILLING_SEED = 4
 
 
 def test_full_loop_kill_parity() -> None:
     """A seed that kills, so the hit path is compared and not just the miss path."""
-    config = _raid_config(KILLING_SEED, 1)
+    config = _raid_config(KILLING_SEED, 1, 1)
     params = EngineParams.from_config(config, engage=True)
 
-    engine = _engine_history(config, params, FULL_LOOP_STEPS)
-    oracle = _oracle_history(config, params, FULL_LOOP_STEPS)
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=1)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 1)
 
     engine_kill = _first_true(engine["threat_killed"][:, 0].numpy())
     oracle_kill = _first_true(np.asarray(oracle["threat_killed"])[:, 0])
@@ -529,8 +574,8 @@ def test_full_loop_kill_parity() -> None:
 
     assert bool(engine["threat_killed"][-1, 0])
     assert not bool(engine["threat_alive"][-1, 0])
-    assert not bool(engine["interceptor_alive"][-1])
-    assert bool(engine["interceptor_committed"][-1])
+    assert not bool(engine["interceptor_alive"][-1, 0])
+    assert bool(engine["interceptor_committed"][-1, 0])
 
 
 def test_full_loop_batch_invariance() -> None:

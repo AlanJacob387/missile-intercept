@@ -70,6 +70,12 @@ def interceptors_committed(state: EnvState) -> float:
     return float(state.interceptor_committed.to(_ACC).sum())
 
 
+def inventory_remaining(state: EnvState) -> float:
+    """Mean unfired rounds per env. Stock is a slot mask, not a counter."""
+    unfired = state.interceptor_enabled & ~state.interceptor_committed
+    return float(unfired.to(_ACC).sum(dim=1).mean())
+
+
 def kills(state: EnvState) -> float:
     """Total active threats killed across the whole batch. A count, not a rate."""
     return float((state.threat_killed & state.threat_active).to(_ACC).sum())
@@ -110,6 +116,7 @@ def summarize(state: EnvState) -> dict[str, float | None]:
         "value_destroyed": value_destroyed(state),
         "damage_prevented_fraction": damage_prevented_fraction(state),
         "interceptors_committed": interceptors_committed(state),
+        "inventory_remaining": inventory_remaining(state),
         "kills": kills(state),
         "committed_per_kill_batch_level": committed_per_kill(state),
         "tracks_held": tracks_held(state),

@@ -5,12 +5,8 @@ environments so the whole step compiles to device work. Compilation is applied i
 later task -- eager first, once parity with the oracle holds.
 
 Order within a tick: threat physics, radar look, tracker predict and update, launch
-decision, guidance, interceptor motion, intercept resolution, impact scoring. The
-tracker sees the post-move truth, and guidance sees only what the tracker produced.
-
-Every interceptor still defaults to track slot 0 -- there is no weapon-target
-assignment yet, so a raid with several threats is only ever contested by whichever
-interceptor slots exist, all aimed at the same track.
+decision, guidance, interceptor motion, intercept resolution. The tracker sees the
+post-move truth, and guidance sees only what the tracker produced.
 """
 
 from __future__ import annotations
@@ -27,6 +23,8 @@ from mdsim.core.dynamics import PhysicsParams
 from mdsim.core.integrator import integrate
 from mdsim.core.state import EnvState
 from mdsim.core.threat_models import get_threat_model
+from mdsim.engagement import doctrine, envelopes, inventory, priority
+from mdsim.engagement.assignment import UNASSIGNED
 from mdsim.guidance.launch import should_launch
 from mdsim.guidance.pro_nav import pn_accel
 from mdsim.sensing import kalman, radar
@@ -52,6 +50,7 @@ class EngineParams:
     kf_q: float
     pn_gain: float
     interceptor: interceptor_mod.InterceptorParams
+    decision_interval_steps: int
     city_impact_radius_m: float
     engage: bool = True
 
@@ -78,6 +77,7 @@ class EngineParams:
             kf_q=config.sim.kf_process_noise_q,
             pn_gain=config.sim.pn_gain,
             interceptor=interceptor_mod.InterceptorParams.from_spec(spec),
+            decision_interval_steps=config.sim.decision_interval_steps,
             city_impact_radius_m=config.sim.city_impact_radius_m,
             engage=engage,
         )
@@ -149,7 +149,12 @@ def _run_tracker(
         open_mask_cov, P_init, torch.where(update_mask_cov, P_upd, P_pred)
     )
 
-    held = tracks.detected | detected
+    # A threat that is no longer alive -- killed, leaked, or grounded -- reflects
+    # nothing back to the radar, so the track drops the same step truth marks it
+    # gone. Without this, `detected` is a one-way OR: a destroyed threat stays
+    # "held" forever, and priority/assignment keep proposing rounds against
+    # wreckage since tracks.detected is the only truth signal they read.
+    held = (tracks.detected | detected) & threat_alive
     return TrackState(
         x_est=x_new,
         P=P_new,
@@ -157,6 +162,44 @@ def _run_tracker(
         age=tracks.age + torch.where(held, dt, torch.zeros_like(tracks.age)),
         updated=detected,
     )
+
+
+def _assign(
+    state: EnvState, params: EngineParams, tracks: TrackState, radar_pos: Tensor
+) -> Tensor:
+    """Bind free interceptor slots to threats, [N, I] int64 with -1 for unbound.
+
+    Runs on a fixed cadence rather than every step, and existing bindings survive
+    untouched. An interceptor already flying at a threat has built geometry that
+    re-aiming throws away, so reassignment thrash costs more than the better pairing
+    it might find. Bindings are released only when the round or the threat resolves.
+
+    Reads TrackState and own-side tensors only. The threatened city is inferred from
+    the track's extrapolated impact point, never from the threat's true target.
+    """
+    engageable = envelopes.in_envelope(
+        tracks.position, radar_pos, params.interceptor
+    )
+    scores, _ = priority.threat_priority(
+        tracks,
+        state.city_pos,
+        state.city_value,
+        state.city_alive,
+        engageable,
+        params.physics.g,
+    )
+
+    already_engaged = inventory.engaged_threats(
+        state.interceptor_target, state.n_threats
+    )
+    assignable = engageable & tracks.detected & ~already_engaged
+    free = inventory.available(state.interceptor_enabled, state.interceptor_committed)
+
+    proposed = doctrine.single_shot(scores, assignable, free)
+    committed = inventory.commit(state.interceptor_target, proposed)
+
+    decide = ((state.step_index % params.decision_interval_steps) == 0).unsqueeze(-1)
+    return torch.where(decide, committed, state.interceptor_target)
 
 
 def step(state: EnvState, params: EngineParams) -> EnvState:
@@ -184,20 +227,32 @@ def step(state: EnvState, params: EngineParams) -> EnvState:
     )
     tracks = _run_tracker(state, params, threat_pos, state.threat_alive, radar_pos)
 
+    interceptor_target = _assign(state, params, tracks, radar_pos)
+
+    # A slot may only fly at the threat it is bound to. Everything unbound, spent or
+    # out of stock is blocked here rather than inside the launch solution, which has
+    # no business knowing about magazines.
+    bound = interceptor_target >= 0
+    blocked = state.interceptor_committed | ~state.interceptor_enabled | ~bound
+    assignment = interceptor_target.clamp(min=0)
+
     launch, launch_vel = should_launch(
         tracks,
         state.interceptor_pos,
-        state.interceptor_committed,
+        blocked,
         params.interceptor.speed_mps,
         params.interceptor.envelope_min_m,
         params.interceptor.envelope_max_m,
+        assignment,
     )
     launch_mask = launch.unsqueeze(-1)
     interceptor_vel = torch.where(launch_mask, launch_vel, state.interceptor_vel)
     interceptor_alive = state.interceptor_alive | launch
     interceptor_committed = state.interceptor_committed | launch
 
-    command = pn_accel(tracks, state.interceptor_pos, interceptor_vel, params.pn_gain)
+    command = pn_accel(
+        tracks, state.interceptor_pos, interceptor_vel, params.pn_gain, assignment
+    )
     command = interceptor_mod.clamp_accel(command, params.interceptor.max_accel_mps2)
 
     moved_pos, moved_vel = integrate(
@@ -221,8 +276,8 @@ def step(state: EnvState, params: EngineParams) -> EnvState:
         state.threat_alive,
         interceptor_alive,
         dt,
-        # Per interceptor, [I]: lethal radius belongs to the warhead. One type per
-        # battery, so every slot carries the same value today.
+        # Per interceptor, [I]: lethal radius belongs to the warhead. Phase 0 flies
+        # one type per battery, so every slot carries the same value today.
         torch.full(
             (state.n_interceptors,),
             params.interceptor.kill_radius_m,
@@ -233,10 +288,15 @@ def step(state: EnvState, params: EngineParams) -> EnvState:
 
     threat_hit = hit.any(dim=2)
     interceptor_hit = hit.any(dim=1)
-    # Unscoped: every interceptor targets slot 0, so there is only one thing a round
-    # could have flown past. Scoping this to an assignment is an engagement-layer
-    # concern.
-    interceptor_passed = passed.any(dim=1)
+
+    # Retirement is scoped to the pair an interceptor is actually flying at. Reducing
+    # `passed` over every threat would retire a round the moment it swept past any
+    # threat in the raid, including ones it was never chasing -- harmless with a
+    # single threat, and with several it spends the magazine on geometry alone.
+    # Kills stay unscoped: a warhead that gets close enough does not check assignment.
+    slot = torch.arange(state.n_threats, device=hit.device).view(1, -1, 1)
+    assigned_pair = interceptor_target.unsqueeze(1) == slot
+    interceptor_passed = (passed & assigned_pair).any(dim=1)
 
     threat_killed = state.threat_killed | threat_hit
     survived = state.threat_alive & ~threat_hit
@@ -259,9 +319,30 @@ def step(state: EnvState, params: EngineParams) -> EnvState:
     # the run open and never resolving.
     grounded = threat_pos[..., 2] < 0.0
 
+    threat_resolved = threat_killed | state.threat_leaked | newly_leaked | grounded
+    bound_index = interceptor_target.clamp(min=0)
+    bound_resolved = torch.gather(threat_resolved, 1, bound_index)
+
+    # A round whose bound threat resolves without that round scoring the kill has
+    # nothing left to fly at. Commitment is a one-way expenditure -- inventory.py
+    # never refunds a fired round -- so the only outcome consistent with that model
+    # is to retire it in place. Left alive, it would keep flying under the next
+    # step's PN command, which gathers track state at `interceptor_target.clamp(min=0)`
+    # and would silently steer it onto threat slot 0.
+    own_hit = torch.gather(hit, 1, bound_index.unsqueeze(1)).squeeze(1)
+    orphaned = (interceptor_target >= 0) & bound_resolved & ~own_hit
+
     # A miss ends the round for that interceptor: closest approach fell inside the
     # step and it did not kill, so it has flown past and is spent.
-    interceptor_alive = interceptor_alive & ~interceptor_hit & ~interceptor_passed
+    interceptor_alive = (
+        interceptor_alive & ~interceptor_hit & ~interceptor_passed & ~orphaned
+    )
+
+    # Release a binding once its round is spent or its threat has resolved. Holding a
+    # stale binding would leave the slot counted as engaging a threat that no longer
+    # exists, and the next decision would skip a live threat to honour it.
+    spent = state.interceptor_committed & ~interceptor_alive
+    released = (interceptor_target >= 0) & (bound_resolved | spent)
 
     # replace() rather than a field-by-field rebuild: a new state field would
     # otherwise have to be threaded through every return site or be silently dropped.
@@ -276,6 +357,7 @@ def step(state: EnvState, params: EngineParams) -> EnvState:
         threat_leaked=state.threat_leaked | newly_leaked,
         interceptor_alive=interceptor_alive,
         interceptor_committed=interceptor_committed,
+        interceptor_target=inventory.release(interceptor_target, released),
         city_alive=state.city_alive & ~destroyed,
         t=state.t + dt,
         step_index=step_index,

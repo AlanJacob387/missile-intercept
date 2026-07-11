@@ -15,6 +15,12 @@ device: xpu
 # Proportional navigation gain. The classical usable band is 3-5.
 pn_gain: 4.0
 
+# Weapon-target assignment cadence. Reassignment is not free: an interceptor already
+# flying at a threat cannot be re-aimed without throwing away the geometry it has
+# built, so assignment runs on this interval and commitments hold until the round
+# resolves. Every step would be reassignment thrash; too long and new tracks wait.
+decision_interval_steps: 20
+
 # A threat within this distance of its target city counts as having reached it.
 # Wider than the interceptor kill radius by two orders of magnitude: this is a
 # city-scale footprint, not a warhead-scale one.

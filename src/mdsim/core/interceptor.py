@@ -20,6 +20,8 @@ class InterceptorParams:
     max_accel_mps2: float
     envelope_min_m: float
     envelope_max_m: float
+    envelope_alt_min_m: float
+    envelope_alt_max_m: float
     reaction_time_s: float
     kill_radius_m: float
 
@@ -30,6 +32,8 @@ class InterceptorParams:
             max_accel_mps2=spec.max_g * G,
             envelope_min_m=spec.envelope_range_km[0] * 1000.0,
             envelope_max_m=spec.envelope_range_km[1] * 1000.0,
+            envelope_alt_min_m=spec.envelope_alt_km[0] * 1000.0,
+            envelope_alt_max_m=spec.envelope_alt_km[1] * 1000.0,
             reaction_time_s=spec.reaction_time_s,
             kill_radius_m=spec.kill_radius_m,
         )

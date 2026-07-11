@@ -19,7 +19,7 @@ _TRACK_PREFIX = "tracks."
 class EnvState:
     """Ground truth for N environments. Only the engine may produce a new one.
 
-    Shapes, with N environments, T threat slots, I interceptors, C cities:
+    Shapes, with N environments, T threat slots, I interceptor slots, C cities:
         threat_pos, threat_vel            [N, T, 3]
         interceptor_pos, interceptor_vel  [N, I, 3]
         threat_alive                      [N, T]   still flying
@@ -29,6 +29,8 @@ class EnvState:
         threat_leaked                     [N, T]   reached its city
         interceptor_alive                 [N, I]   in flight now
         interceptor_committed             [N, I]   launched at some point
+        interceptor_enabled               [N, I]   magazine holds a round for this slot
+        interceptor_target                [N, I]   bound threat slot, -1 uncommitted
         city_pos                          [N, C, 3]
         city_value                        [N, C]
         city_alive                        [N, C]
@@ -38,8 +40,13 @@ class EnvState:
         tracks                            TrackState
 
     Threat slots are fixed at T and masked by `threat_active`. Inactive slots are
-    excluded from physics, radar and scoring, which keeps every raid size the same
-    tensor shape.
+    excluded from physics, radar, assignment and scoring, which keeps every raid
+    size the same tensor shape -- a saturation sweep varies how many slots are
+    active, not how big the arrays are.
+
+    Inventory is `interceptor_enabled`: a disabled slot has no round and can never
+    launch. Remaining stock is `enabled & ~committed`, so magazine depth is a mask
+    rather than a counter that could drift out of step with the slots.
 
     Every field carries the leading N_envs dimension, so operations on the state are
     written batched by hand rather than mapped over a per-environment function.
@@ -59,6 +66,8 @@ class EnvState:
     threat_leaked: Tensor
     interceptor_alive: Tensor
     interceptor_committed: Tensor
+    interceptor_enabled: Tensor
+    interceptor_target: Tensor
     city_pos: Tensor
     city_value: Tensor
     city_alive: Tensor
@@ -123,6 +132,7 @@ def make_initial(
     device: torch.device | str,
     dtype: torch.dtype = torch.float32,
     n_active_threats: int | None = None,
+    inventory: int | None = None,
 ) -> EnvState:
     """Build the t=0 batched state for a scenario.
 
@@ -134,8 +144,9 @@ def make_initial(
     algorithm rather than float32 rounding. float64 runs on XPU but is emulated
     there, so the parity gate uses it on CPU.
 
-    n_active_threats overrides the scenario's threat slot count without changing
-    tensor shapes. Defaults to fully active.
+    n_active_threats and inventory override the scenario's slot counts without
+    changing tensor shapes, which is what the saturation sweep varies. Both default
+    to fully active.
     """
     n = config.sim.n_envs
     n_threats = config.scenario.n_threats
@@ -143,8 +154,11 @@ def make_initial(
     n_cities = len(config.cities)
 
     active_count = n_threats if n_active_threats is None else n_active_threats
+    stock = n_interceptors if inventory is None else inventory
     if not 0 <= active_count <= n_threats:
         raise ValueError(f"n_active_threats must be in [0, {n_threats}], got {active_count}")
+    if not 0 <= stock <= n_interceptors:
+        raise ValueError(f"inventory must be in [0, {n_interceptors}], got {stock}")
 
     # Launch state is derived from the scenario's engagement range, not written in
     # config: terminal speed has to emerge from the flight, not be declared.
@@ -173,6 +187,9 @@ def make_initial(
     slot_index = torch.arange(n_threats, device=device)
     threat_active = (slot_index < active_count).expand(n, n_threats)
 
+    round_index = torch.arange(n_interceptors, device=device)
+    interceptor_enabled = (round_index < stock).expand(n, n_interceptors)
+
     city_pos = torch.tensor(
         [city.position_m for city in config.cities], dtype=dtype, device=device
     ).expand(n, n_cities, 3)
@@ -198,6 +215,10 @@ def make_initial(
         threat_leaked=false_threats.clone(),
         interceptor_alive=false_interceptors.clone(),
         interceptor_committed=false_interceptors.clone(),
+        interceptor_enabled=interceptor_enabled.contiguous(),
+        interceptor_target=torch.full(
+            (n, n_interceptors), -1, dtype=torch.int64, device=device
+        ),
         city_pos=city_pos.contiguous(),
         city_value=city_value.contiguous(),
         city_alive=torch.ones((n, n_cities), dtype=torch.bool, device=device),

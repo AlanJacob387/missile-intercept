@@ -19,6 +19,11 @@ import torch
 
 from mdsim.core.config import load_config
 from mdsim.core.state import EnvState, make_initial
+from mdsim.engagement import assignment as assignment_module
+from mdsim.engagement import doctrine as doctrine_module
+from mdsim.engagement import envelopes as envelopes_module
+from mdsim.engagement import inventory as inventory_module
+from mdsim.engagement import priority as priority_module
 from mdsim.envs.engine import EngineParams, step
 from mdsim.guidance import launch as launch_module
 from mdsim.guidance import pro_nav as pro_nav_module
@@ -29,11 +34,21 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
 GUIDANCE_MODULES = (pro_nav_module, launch_module)
 
-DECIDING_MODULES = GUIDANCE_MODULES
+# Assignment is under the same constraint as guidance. A solver handed the true target
+# list would never mis-prioritise, and the whole point of Phase 1 is that it must.
+ENGAGEMENT_MODULES = (
+    priority_module,
+    assignment_module,
+    envelopes_module,
+    inventory_module,
+    doctrine_module,
+)
 
-# Names that would betray a truth argument even if the annotation were loose. The
-# specific field names matter as much as the generic words: threat_target_city is the
-# one most likely to creep in later, because reading it makes prioritisation trivially
+DECIDING_MODULES = GUIDANCE_MODULES + ENGAGEMENT_MODULES
+
+# Names that would betray a truth argument even if the annotation were loose.
+# The specific field names matter as much as the generic words: threat_target_city is
+# the one most likely to creep in, because reading it makes prioritisation trivially
 # correct and silently deletes the uncertainty the defender is supposed to face.
 FORBIDDEN_SUBSTRINGS = (
     "truth",
@@ -111,6 +126,19 @@ def test_deciding_modules_do_not_import_env_state(module) -> None:
         )
 
 
+def test_priority_infers_the_threatened_city_rather_than_reading_it() -> None:
+    """The defender must work out what is being aimed at, not be told.
+
+    threat_priority takes city geometry, which is the defender's own, and a
+    TrackState. It takes no per-threat target index: that mapping is truth, and
+    handing it over would make prioritisation exact and the problem trivial.
+    """
+    parameters = inspect.signature(priority_module.threat_priority).parameters
+    assert "tracks" in parameters
+    assert typing.get_type_hints(priority_module.threat_priority)["tracks"] is TrackState
+    assert not any("target" in name for name in parameters)
+
+
 def test_damage_is_allowed_to_read_truth() -> None:
     """Deliberate asymmetry, asserted so it is not "fixed" later.
 
@@ -140,13 +168,13 @@ def evolved_state() -> EnvState:
     """A state carried far enough for the tracker to have opened and updated tracks.
 
     Several threat slots, so the storage check covers the multi-threat tensors the
-    world layer reads rather than a degenerate single column.
+    assignment layer reads rather than a degenerate single column.
     """
     config = load_config(CONFIG_DIR)
     config = replace(
         config,
         sim=replace(config.sim, n_envs=8),
-        scenario=replace(config.scenario, n_threats=3, n_interceptors=1),
+        scenario=replace(config.scenario, n_threats=3, n_interceptors=3),
     )
     params = EngineParams.from_config(config, engage=True)
 

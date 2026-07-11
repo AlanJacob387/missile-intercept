@@ -71,6 +71,7 @@ class SimConfig:
     device: str
     pn_gain: float
     kf_process_noise_q: float
+    decision_interval_steps: int
     city_impact_radius_m: float
 
 
@@ -253,6 +254,12 @@ def _non_negative(value: Any, name: str, where: str) -> float:
     return float(value)
 
 
+def _positive_int(value: Any, name: str, where: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ConfigError(f"{where}: {name} must be an integer >= 1, got {value!r}")
+    return value
+
+
 def _vec3(value: Any, name: str, where: str) -> tuple[float, float, float]:
     if not isinstance(value, (list, tuple)) or len(value) != 3:
         raise ConfigError(f"{where}: {name} must be a length-3 vector, got {value!r}")
@@ -277,6 +284,7 @@ def parse_sim(data: Mapping[str, Any]) -> SimConfig:
         "device",
         "pn_gain",
         "kf_process_noise_q",
+        "decision_interval_steps",
         "city_impact_radius_m",
     )
     _require(data, fields, "sim")
@@ -307,6 +315,9 @@ def parse_sim(data: Mapping[str, Any]) -> SimConfig:
         pn_gain=_positive(data["pn_gain"], "pn_gain", "sim"),
         kf_process_noise_q=_positive(
             data["kf_process_noise_q"], "kf_process_noise_q", "sim"
+        ),
+        decision_interval_steps=_positive_int(
+            data["decision_interval_steps"], "decision_interval_steps", "sim"
         ),
         city_impact_radius_m=_positive(
             data["city_impact_radius_m"], "city_impact_radius_m", "sim"
