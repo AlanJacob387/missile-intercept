@@ -30,6 +30,10 @@ from mdsim.eval.metrics import leakage
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
+# The whole file shares one module-scoped grid fixture that runs several thousand-step
+# engagements to resolution; that fixture, not any one assertion, is the cost.
+pytestmark = pytest.mark.slow
+
 N_ENVS = 64
 THREAT_SLOTS = 8
 INTERCEPTOR_SLOTS = 8

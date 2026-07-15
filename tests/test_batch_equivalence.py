@@ -461,6 +461,7 @@ def _raid_config(seed: int, n_threats: int, n_interceptors: int):
     )
 
 
+@pytest.mark.slow
 def test_full_loop_engine_vs_oracle() -> None:
     """A multi-threat raid must match the oracle step for step, covariance included.
 
@@ -498,6 +499,7 @@ def test_full_loop_engine_vs_oracle() -> None:
     assert killed + leaked > 0, "the raid never resolved"
 
 
+@pytest.mark.slow
 def test_single_threat_regression() -> None:
     """One threat and one round must still behave as a single engagement, end to end.
 
@@ -549,6 +551,7 @@ def test_single_threat_regression() -> None:
 KILLING_SEED = 4
 
 
+@pytest.mark.slow
 def test_full_loop_kill_parity() -> None:
     """A seed that kills, so the hit path is compared and not just the miss path."""
     config = _raid_config(KILLING_SEED, 1, 1)
@@ -578,6 +581,7 @@ def test_full_loop_kill_parity() -> None:
     assert bool(engine["interceptor_committed"][-1, 0])
 
 
+@pytest.mark.slow
 def test_full_loop_batch_invariance() -> None:
     """Batch invariance must survive the sensing and guidance layers, not just physics.
 

@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  fast-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyTorch (CPU)
+        # The plain PyPI Linux wheel for torch declares cuda-toolkit and several
+        # nvidia-* packages as unconditional dependencies, not extras -- installing
+        # it here would pull several GB of CUDA runtime that a CPU-only runner never
+        # uses. Installing the CPU build first satisfies torch>=2.7 before the next
+        # step resolves it, so pip leaves it alone rather than re-resolving against
+        # the default index.
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Run fast test suite
+        run: pytest -m "not slow" -q

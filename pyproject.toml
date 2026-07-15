@@ -15,6 +15,7 @@ requires-python = ">=3.11"
 dependencies = [
     "torch>=2.7",
     "numpy",
+    "scipy",
     "pyyaml",
     "matplotlib",
     "pytest",
@@ -27,3 +28,6 @@ where = ["src"]
 testpaths = ["tests"]
 # "." puts the un-installed reference oracle on the path alongside the package.
 pythonpath = ["src", "."]
+markers = [
+    "slow: long-running (multi-thousand-step engagements or sweep grids); excluded from CI, run locally with `pytest -m slow` or as part of the full suite.",
+]
