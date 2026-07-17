@@ -330,6 +330,10 @@ def _oracle_params(params: EngineParams) -> EngagementParams:
         city_impact_radius_m=params.city_impact_radius_m,
         rho0=params.physics.rho0,
         scale_height_m=params.physics.scale_height_m,
+        threat_model=params.physics.threat_model,
+        maneuver_accel_mps2=params.physics.maneuver_accel_mps2,
+        maneuver_period_s=params.physics.maneuver_period_s,
+        salvo_size=params.salvo_size,
     )
 
 
@@ -350,7 +354,11 @@ _EXACT_FIELDS = (
 
 
 def _engine_history(
-    config, params: EngineParams, n_steps: int, inventory: int | None = None
+    config,
+    params: EngineParams,
+    n_steps: int,
+    inventory: int | None = None,
+    step_fn=step,
 ) -> dict[str, torch.Tensor]:
     """Run the engine at N=1 in float64, recording every field the oracle returns."""
     state = make_initial(config, "cpu", dtype=torch.float64, inventory=inventory)
@@ -360,7 +368,7 @@ def _engine_history(
     }
 
     for _ in range(n_steps):
-        state = step(state, params)
+        state = step_fn(state, params)
         frames["threat_pos"].append(state.threat_pos[0].clone())
         frames["interceptor_pos"].append(state.interceptor_pos[0].clone())
         frames["track_x"].append(state.tracks.x_est[0].clone())
@@ -579,6 +587,58 @@ def test_full_loop_kill_parity() -> None:
     assert not bool(engine["threat_alive"][-1, 0])
     assert not bool(engine["interceptor_alive"][-1, 0])
     assert bool(engine["interceptor_committed"][-1, 0])
+
+
+def _phase2_config(seed: int, n_threats: int, n_interceptors: int, threat: str | None = None):
+    """A raid config with an optional threat override, for Phase 2 parity cases."""
+    config = _raid_config(seed, n_threats, n_interceptors)
+    if threat is not None:
+        config = replace(config, scenario=replace(config.scenario, threat=threat))
+    return config
+
+
+@pytest.mark.slow
+def test_full_loop_weave_parity() -> None:
+    """Maneuvering threat physics (weave) against the independent oracle.
+
+    iskander_m carries a real maneuver_g anchor; the KF tracker is Phase 1's, kept
+    fixed here so this isolates the threat-model physics from the tracker choice.
+    """
+    config = _phase2_config(0, 1, 1, threat="iskander_m")
+    params = EngineParams.from_config(config, engage=True)
+    params = replace(params, physics=replace(params.physics, threat_model="weave"))
+
+    # Long enough for the interceptor to actually launch (~step 3300 for iskander_m
+    # under weave) -- short of that, interceptor_pos never leaves the battery origin
+    # on either side and the relative-deviation scale is degenerately zero.
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=1)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 1)
+
+    deviations = _compare(engine, oracle)
+    report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
+    print(f"weave engine vs oracle: {report}")
+    for name, deviation in deviations.items():
+        assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
+
+
+@pytest.mark.slow
+def test_full_loop_salvo_parity() -> None:
+    """Salvo (size 2) inventory/assignment bookkeeping against the oracle."""
+    config = _raid_config(4, 1, 3)
+    params = EngineParams.from_config(config, engage=True)
+    params = replace(params, salvo_size=2)
+
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=3)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 3)
+
+    deviations = _compare(engine, oracle)
+    report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
+    print(f"salvo engine vs oracle: {report}")
+    for name, deviation in deviations.items():
+        assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
+
+    committed = int(engine["interceptor_committed"][-1].sum())
+    assert committed > 1, "salvo never committed more than one round"
 
 
 @pytest.mark.slow

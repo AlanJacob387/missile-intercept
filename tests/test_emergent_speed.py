@@ -61,9 +61,10 @@ def _fly_to_ground(speed_mps: float, burnout_alt_m: float, beta: float, dt: floa
     apogee = burnout_alt_m
     measured = None
     ascending = True
+    t = torch.zeros(1, dtype=torch.float64)  # ballistic ignores t; shape only needs to match pos's batch dim
 
     for _ in range(500_000):
-        accel = ballistic(pos, vel, params)
+        accel = ballistic(pos, vel, params, t)
         new_pos, new_vel = step_semi_implicit(pos, vel, accel, dt)
 
         z_old = float(pos[0, 0, 2])

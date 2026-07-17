@@ -31,6 +31,8 @@ class PhysicsParams:
     scale_height_m: float = 8500.0
     threat_model: str = "ballistic"
     integrator: str = "semi_implicit"
+    maneuver_accel_mps2: float = 0.0
+    maneuver_period_s: float = 20.0
 
     @classmethod
     def from_config(cls, config: Config) -> PhysicsParams:
@@ -39,6 +41,7 @@ class PhysicsParams:
             dt=config.sim.dt,
             beta=spec.ballistic_coefficient_beta,
             integrator=config.sim.integrator,
+            maneuver_accel_mps2=spec.maneuver_g * G,
         )
 
 

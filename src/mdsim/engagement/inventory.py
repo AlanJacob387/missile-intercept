@@ -49,19 +49,27 @@ def release(interceptor_target: Tensor, released: Tensor) -> Tensor:
     )
 
 
-def engaged_threats(interceptor_target: Tensor, n_threats: int) -> Tensor:
-    """Threats that already have a shooter bound to them, [N, T] bool.
+def engaged_threats(
+    interceptor_target: Tensor, n_threats: int, salvo_size: int = 1
+) -> Tensor:
+    """Threats already holding a full salvo of bound shooters, [N, T] bool.
 
     Scatters into a buffer one column wider than needed and drops the extra column,
     so unbound slots have somewhere harmless to write. Pointing them at index 0
     instead would let an unbound slot overwrite a genuine binding on threat 0.
+
+    Counts bound slots per threat rather than testing for any, via scatter_add_
+    instead of a boolean scatter_, so a threat stays assignable until it holds
+    `salvo_size` rounds rather than dropping out after the first. `salvo_size=1`
+    makes "count >= 1" the same test as "any bound", so this is an exact
+    generalisation of the Phase 1 behaviour, not a change to it.
     """
     n_envs = interceptor_target.shape[0]
     sentinel = torch.full_like(interceptor_target, n_threats)
     index = torch.where(interceptor_target >= 0, interceptor_target, sentinel)
 
-    marked = torch.zeros(
-        (n_envs, n_threats + 1), dtype=torch.bool, device=interceptor_target.device
+    counts = torch.zeros(
+        (n_envs, n_threats + 1), dtype=torch.int64, device=interceptor_target.device
     )
-    marked.scatter_(1, index, torch.ones_like(index, dtype=torch.bool))
-    return marked[:, :n_threats]
+    counts.scatter_add_(1, index, torch.ones_like(index, dtype=torch.int64))
+    return counts[:, :n_threats] >= salvo_size

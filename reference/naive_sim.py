@@ -74,6 +74,39 @@ def _drag_accel(
     return -(rho * float(np.linalg.norm(vel)) / (2.0 * beta)) * vel
 
 
+def _lateral_axis(vel: np.ndarray) -> np.ndarray:
+    """Unit vector perpendicular to vel and to +z. Degenerate near-vertical flight
+    is left undefined past a clamp on the norm, mirroring the engine's own choice."""
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    cross = np.cross(vel, up)
+    norm = max(float(np.linalg.norm(cross)), 1e-6)
+    return cross / norm
+
+
+def _maneuver_accel(
+    pos: np.ndarray, vel: np.ndarray, t_now: float, threat_model: str, amp: float, period_s: float
+) -> np.ndarray:
+    """Extra divert term for a scripted maneuver, added to gravity+drag.
+
+    ballistic: zero. weave: sinusoidal lateral divert. pop_up: sinusoidal vertical
+    divert. lateral_step: bang-bang lateral divert (square wave). t_now is the
+    elapsed simulation time at the START of this step (pre-integration), matching
+    the engine's own EnvState.t convention exactly -- the caller passes k * dt.
+    """
+    if threat_model == "ballistic":
+        return np.zeros(3, dtype=np.float64)
+    phase = (2.0 * np.pi / period_s) * t_now
+    if threat_model == "weave":
+        return _lateral_axis(vel) * (amp * np.sin(phase))
+    if threat_model == "pop_up":
+        vertical = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        return vertical * (amp * np.sin(phase))
+    if threat_model == "lateral_step":
+        sign = np.sign(np.sin(phase))
+        return _lateral_axis(vel) * (amp * sign)
+    raise ValueError(f"unknown threat model {threat_model!r}")
+
+
 def propagate(
     pos0: np.ndarray | list[float],
     vel0: np.ndarray | list[float],
@@ -185,6 +218,11 @@ class EngagementParams:
     city_impact_radius_m: float
     rho0: float = RHO0
     scale_height_m: float = SCALE_HEIGHT_M
+    # Phase 2, all defaulted to Phase 0/1 behaviour.
+    threat_model: str = "ballistic"
+    maneuver_accel_mps2: float = 0.0
+    maneuver_period_s: float = 20.0
+    salvo_size: int = 1
 
 
 def _to_spherical(rel: np.ndarray) -> np.ndarray:
@@ -439,13 +477,18 @@ def _greedy_naive(priority, assignable, available):
     return target
 
 
-def _engaged_threats(interceptor_target, n_threats):
-    """Threats that already have a shooter bound to them, [T] bool."""
-    engaged = np.zeros(n_threats, dtype=bool)
+def _engaged_threats(interceptor_target, n_threats, salvo_size=1):
+    """Threats already holding a full salvo of bound shooters, [T] bool.
+
+    Counts bound slots per threat rather than testing for any, so a threat stays
+    assignable until it holds salvo_size rounds. salvo_size=1 makes "count >= 1"
+    the same test as "any bound", the exact Phase 1 behaviour.
+    """
+    counts = np.zeros(n_threats, dtype=np.int64)
     for bound in interceptor_target:
         if bound >= 0:
-            engaged[bound] = True
-    return engaged
+            counts[bound] += 1
+    return counts >= salvo_size
 
 
 def _reached_city(pos_before, pos_after, city, radius, dt) -> bool:
@@ -552,11 +595,18 @@ def run_engagement(
         threat_alive_before = threat_alive.copy()
         interceptor_committed_before = interceptor_committed.copy()
 
-        # 1. Threat physics. Gravity plus drag evaluated at the old state, then
-        # semi-implicit Euler. Frozen once the threat is dead.
+        # 1. Threat physics. Gravity plus drag plus any scripted maneuver, evaluated
+        # at the old state, then semi-implicit Euler. Frozen once the threat is dead.
+        # t_now is the elapsed time BEFORE this step's integration -- matches the
+        # engine's own EnvState.t, read pre-increment.
+        t_now = k * dt
         for t in range(n_threats):
             accel = gravity + _drag_accel(
                 threat_pos[t], threat_vel[t], p.beta, p.rho0, p.scale_height_m
+            )
+            accel = accel + _maneuver_accel(
+                threat_pos[t], threat_vel[t], t_now, p.threat_model,
+                p.maneuver_accel_mps2, p.maneuver_period_s,
             )
             new_vel = threat_vel[t] + accel * dt
             new_pos = threat_pos[t] + new_vel * dt
@@ -616,12 +666,23 @@ def run_engagement(
         priority = _threat_priority(
             track_x, track_detected, engageable, cities, values, city_alive, p.g
         )
-        already_engaged = _engaged_threats(interceptor_target, n_threats)
+        already_engaged = _engaged_threats(interceptor_target, n_threats, p.salvo_size)
         assignable = engageable & track_detected & ~already_engaged
         available = enabled & ~interceptor_committed
 
         if (k % p.decision_interval_steps) == 0:
-            proposed = _greedy_naive(priority, assignable, available)
+            # Salvo: up to salvo_size rounds per threat in this one decision, each
+            # round competing for whatever slots the previous round left available.
+            # priority/assignable are untouched between rounds -- mirrors
+            # doctrine.salvo exactly, one Python loop standing in for the other.
+            proposed = np.full(n_interceptors, -1, dtype=np.int64)
+            remaining = available.copy()
+            for _round in range(p.salvo_size):
+                round_binding = _greedy_naive(priority, assignable, remaining)
+                for i in range(n_interceptors):
+                    if round_binding[i] >= 0:
+                        proposed[i] = round_binding[i]
+                        remaining[i] = False
             for i in range(n_interceptors):
                 if proposed[i] >= 0:
                     interceptor_target[i] = proposed[i]

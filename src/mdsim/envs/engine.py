@@ -53,6 +53,13 @@ class EngineParams:
     decision_interval_steps: int
     city_impact_radius_m: float
     engage: bool = True
+    # Phase 2 additions, all defaulted to the Phase 0/1 behaviour: a caller that never
+    # sets these gets byte-identical output to before these fields existed.
+    salvo_size: int = 1
+
+    def __post_init__(self) -> None:
+        if self.salvo_size < 1:
+            raise ValueError(f"salvo_size must be >= 1, got {self.salvo_size}")
 
     @classmethod
     def from_config(
@@ -86,7 +93,7 @@ class EngineParams:
 def _advance_threats(state: EnvState, params: EngineParams) -> tuple[Tensor, Tensor]:
     physics = params.physics
     accel_fn = get_threat_model(physics.threat_model)
-    accel = accel_fn(state.threat_pos, state.threat_vel, physics)
+    accel = accel_fn(state.threat_pos, state.threat_vel, physics, state.t)
     pos, vel = integrate(
         state.threat_pos, state.threat_vel, accel, physics.dt, physics.integrator
     )
@@ -190,12 +197,12 @@ def _assign(
     )
 
     already_engaged = inventory.engaged_threats(
-        state.interceptor_target, state.n_threats
+        state.interceptor_target, state.n_threats, params.salvo_size
     )
     assignable = engageable & tracks.detected & ~already_engaged
     free = inventory.available(state.interceptor_enabled, state.interceptor_committed)
 
-    proposed = doctrine.single_shot(scores, assignable, free)
+    proposed = doctrine.salvo(scores, assignable, free, params.salvo_size)
     committed = inventory.commit(state.interceptor_target, proposed)
 
     decide = ((state.step_index % params.decision_interval_steps) == 0).unsqueeze(-1)
