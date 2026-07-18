@@ -222,6 +222,8 @@ class EngagementParams:
     threat_model: str = "ballistic"
     maneuver_accel_mps2: float = 0.0
     maneuver_period_s: float = 20.0
+    tracker: str = "kf"
+    imm_q_ca: float = 0.0
     salvo_size: int = 1
 
 
@@ -323,6 +325,167 @@ def _kf_initialize(z, R, velocity_variance):
     P[:3, :3] = R
     P[3:, 3:] = np.eye(3, dtype=np.float64) * velocity_variance
     return x, P
+
+
+# IMM: two models -- constant-velocity (index 0) and constant-acceleration (index 1)
+# -- sharing one 9-state augmented representation [px,py,pz,vx,vy,vz,ax,ay,az] so they
+# mix in a common space even though only the CA model's transition reads the
+# acceleration component. These constants are a shared protocol with
+# sensing/imm.py's own defaults, not independently guessed: the parity gate compares
+# actual numbers, so the modeling choices behind them (how sticky each mode is, how
+# wide the initial acceleration prior is) have to be identical on both sides, the
+# same way the RNG stream ids and the radar sigmas already are.
+IMM_TRANSITION_MATRIX = ((0.95, 0.05), (0.10, 0.90))
+IMM_MU0 = (0.9, 0.1)
+IMM_INITIAL_VELOCITY_VARIANCE = 1.0e6
+IMM_INITIAL_ACCEL_VARIANCE = 1.0e4
+IMM_CV_ACCEL_EPSILON = 1.0e-8
+
+
+def _imm_transition_cv(dt: float) -> np.ndarray:
+    F = np.eye(9, dtype=np.float64)
+    F[0:3, 3:6] = np.eye(3) * dt
+    return F
+
+
+def _imm_transition_ca(dt: float) -> np.ndarray:
+    F = np.eye(9, dtype=np.float64)
+    F[0:3, 3:6] = np.eye(3) * dt
+    F[0:3, 6:9] = np.eye(3) * (0.5 * dt**2)
+    F[3:6, 6:9] = np.eye(3) * dt
+    return F
+
+
+def _imm_process_noise_cv(dt: float, q_cv: float) -> np.ndarray:
+    Q = np.zeros((9, 9), dtype=np.float64)
+    Q[0:6, 0:6] = _process_noise(dt, q_cv)
+    Q[6:9, 6:9] = np.eye(3) * IMM_CV_ACCEL_EPSILON
+    return Q
+
+
+def _imm_process_noise_ca(dt: float, q_ca: float) -> np.ndarray:
+    eye3 = np.eye(3, dtype=np.float64)
+    Q = np.zeros((9, 9), dtype=np.float64)
+    Q[0:3, 0:3] = eye3 * (dt**5 / 20.0)
+    Q[0:3, 3:6] = eye3 * (dt**4 / 8.0)
+    Q[3:6, 0:3] = eye3 * (dt**4 / 8.0)
+    Q[0:3, 6:9] = eye3 * (dt**3 / 6.0)
+    Q[6:9, 0:3] = eye3 * (dt**3 / 6.0)
+    Q[3:6, 3:6] = eye3 * (dt**3 / 3.0)
+    Q[3:6, 6:9] = eye3 * (dt**2 / 2.0)
+    Q[6:9, 3:6] = eye3 * (dt**2 / 2.0)
+    Q[6:9, 6:9] = eye3 * dt
+    return Q * q_ca
+
+
+def _imm_measurement_matrix() -> np.ndarray:
+    H = np.zeros((3, 9), dtype=np.float64)
+    H[:, 0:6] = _measurement_matrix()
+    return H
+
+
+def _imm_predict(x, P, dt, F, Q, known_accel):
+    x_pred = F @ x
+    if known_accel is not None:
+        delta_v = known_accel * dt
+        delta = np.zeros(9, dtype=np.float64)
+        delta[0:3] = delta_v * dt
+        delta[3:6] = delta_v
+        x_pred = x_pred + delta
+    return x_pred, F @ P @ F.T + Q
+
+
+def _imm_update(x, P, H, z, R):
+    innovation = z - H @ x
+    PHt = P @ H.T
+    S = H @ PHt + R
+    K = np.linalg.solve(S, PHt.T).T
+    x_new = x + K @ innovation
+    dim = x.shape[0]
+    A = np.eye(dim, dtype=np.float64) - K @ H
+    P_new = A @ P @ A.T + K @ R @ K.T
+    return x_new, P_new, innovation, S
+
+
+def _imm_log_likelihood(innovation: np.ndarray, S: np.ndarray) -> float:
+    """logL = -0.5 innovation^T S^-1 innovation - 0.5 logdet(S) - 1.5 log(2 pi)."""
+    sol = np.linalg.solve(S, innovation)
+    quad = float(innovation @ sol)
+    _, logdet = np.linalg.slogdet(S)
+    return -0.5 * quad - 0.5 * logdet - 1.5 * np.log(2.0 * np.pi)
+
+
+def _imm_mix(mu_prev, x_prev, P_prev, Pi):
+    """mu_prev [2], x_prev [2,9], P_prev [2,9,9], Pi [2,2] (row i = from model i)."""
+    c = np.array([Pi[0, j] * mu_prev[0] + Pi[1, j] * mu_prev[1] for j in range(2)])
+    w = np.array([[Pi[i, j] * mu_prev[i] / c[j] for j in range(2)] for i in range(2)])
+
+    x0 = np.stack([w[0, j] * x_prev[0] + w[1, j] * x_prev[1] for j in range(2)])
+
+    P0 = np.zeros((2, 9, 9), dtype=np.float64)
+    for j in range(2):
+        acc = np.zeros((9, 9), dtype=np.float64)
+        for i in range(2):
+            diff = x_prev[i] - x0[j]
+            acc = acc + w[i, j] * (P_prev[i] + np.outer(diff, diff))
+        P0[j] = acc
+    return c, x0, P0
+
+
+def _imm_combine(x_models, P_models, mu):
+    x_comb = mu[0] * x_models[0] + mu[1] * x_models[1]
+    acc = np.zeros((9, 9), dtype=np.float64)
+    for j in range(2):
+        diff = x_models[j] - x_comb
+        acc = acc + mu[j] * (P_models[j] + np.outer(diff, diff))
+    return x_comb, acc
+
+
+def _imm_initialize_track(z, R):
+    """First detection: both models start from the same measurement."""
+    x9 = np.concatenate([z, np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64)])
+    P9 = np.zeros((9, 9), dtype=np.float64)
+    P9[0:3, 0:3] = R
+    P9[3:6, 3:6] = np.eye(3) * IMM_INITIAL_VELOCITY_VARIANCE
+    P9[6:9, 6:9] = np.eye(3) * IMM_INITIAL_ACCEL_VARIANCE
+    x_models = np.stack([x9, x9])
+    P_models = np.stack([P9, P9])
+    mu = np.array(IMM_MU0, dtype=np.float64)
+    return x_models, P_models, mu
+
+
+def _imm_step_track(x_models_prev, P_models_prev, mu_prev, z, R, dt, q_cv, q_ca, gravity, detected):
+    """One IMM predict/(update|coast) tick for one track. Mirrors sensing/imm.py's
+    imm_step, independently written per-track instead of batched."""
+    Pi = np.array(IMM_TRANSITION_MATRIX, dtype=np.float64)
+    c, x0, P0 = _imm_mix(mu_prev, x_models_prev, P_models_prev, Pi)
+
+    F_cv, F_ca = _imm_transition_cv(dt), _imm_transition_ca(dt)
+    Q_cv, Q_ca = _imm_process_noise_cv(dt, q_cv), _imm_process_noise_ca(dt, q_ca)
+
+    x_pred_cv, P_pred_cv = _imm_predict(x0[0], P0[0], dt, F_cv, Q_cv, gravity)
+    x_pred_ca, P_pred_ca = _imm_predict(x0[1], P0[1], dt, F_ca, Q_ca, gravity)
+
+    if detected:
+        H = _imm_measurement_matrix()
+        x_upd_cv, P_upd_cv, innov_cv, S_cv = _imm_update(x_pred_cv, P_pred_cv, H, z, R)
+        x_upd_ca, P_upd_ca, innov_ca, S_ca = _imm_update(x_pred_ca, P_pred_ca, H, z, R)
+        logL_cv = _imm_log_likelihood(innov_cv, S_cv)
+        logL_ca = _imm_log_likelihood(innov_ca, S_ca)
+        max_logL = max(logL_cv, logL_ca)
+        w_cv = c[0] * np.exp(logL_cv - max_logL)
+        w_ca = c[1] * np.exp(logL_ca - max_logL)
+        total = w_cv + w_ca
+        mu_new = np.array([w_cv / total, w_ca / total], dtype=np.float64)
+        x_final = np.stack([x_upd_cv, x_upd_ca])
+        P_final = np.stack([P_upd_cv, P_upd_ca])
+    else:
+        mu_new = c
+        x_final = np.stack([x_pred_cv, x_pred_ca])
+        P_final = np.stack([P_pred_cv, P_pred_ca])
+
+    x_comb, P_comb = _imm_combine(x_final, P_final, mu_new)
+    return x_final, P_final, mu_new, x_comb[:6], P_comb[:6, :6]
 
 
 def _predicted_intercept(track_pos, track_vel, launch_pos, speed):
@@ -566,6 +729,15 @@ def run_engagement(
     track_P = np.stack([np.eye(6, dtype=np.float64) for _ in range(n_threats)])
     track_detected = np.zeros(n_threats, dtype=bool)
 
+    # IMM bookkeeping. Always allocated, only read when p.tracker == "imm" -- mirrors
+    # the engine's lazy placeholder (an inert prior every track can safely mix from
+    # before its first real detection, which imm_initialize overwrites).
+    track_mu = np.tile(np.array(IMM_MU0, dtype=np.float64), (n_threats, 1))
+    track_x_models = np.zeros((n_threats, 2, 9), dtype=np.float64)
+    track_P_models = np.stack(
+        [np.stack([np.eye(9, dtype=np.float64), np.eye(9, dtype=np.float64)]) for _ in range(n_threats)]
+    )
+
     seeds = np.array([seed], dtype=np.int64)
     gravity = np.array([0.0, 0.0, -p.g], dtype=np.float64)
 
@@ -638,19 +810,31 @@ def run_engagement(
             in_range = true_sph[0] <= p.detect_range_m
             detected = bool(on_cadence and in_range and threat_alive_before[t])
 
-            x_pred, P_pred = _kf_predict(
-                track_x[t], track_P[t], dt, p.kf_q, known_accel=gravity
-            )
             R = _measurement_covariance(measured_sph, p)
+            opening = detected and not track_detected[t]
 
-            if detected and not track_detected[t]:
-                track_x[t], track_P[t] = _kf_initialize(
-                    measured_cart, R, p.initial_velocity_variance
+            if p.tracker == "imm":
+                x_final, P_final, mu_final, x6, P6 = _imm_step_track(
+                    track_x_models[t], track_P_models[t], track_mu[t],
+                    measured_cart, R, dt, p.kf_q, p.imm_q_ca, gravity, detected,
                 )
-            elif detected and track_detected[t]:
-                track_x[t], track_P[t] = _kf_update(x_pred, P_pred, measured_cart, R)
+                if opening:
+                    x_final, P_final, mu_final = _imm_initialize_track(measured_cart, R)
+                    x6, P6 = x_final[0][:6], P_final[0][:6, :6]
+                track_x_models[t], track_P_models[t], track_mu[t] = x_final, P_final, mu_final
+                track_x[t], track_P[t] = x6, P6
             else:
-                track_x[t], track_P[t] = x_pred, P_pred
+                x_pred, P_pred = _kf_predict(
+                    track_x[t], track_P[t], dt, p.kf_q, known_accel=gravity
+                )
+                if opening:
+                    track_x[t], track_P[t] = _kf_initialize(
+                        measured_cart, R, p.initial_velocity_variance
+                    )
+                elif detected and track_detected[t]:
+                    track_x[t], track_P[t] = _kf_update(x_pred, P_pred, measured_cart, R)
+                else:
+                    track_x[t], track_P[t] = x_pred, P_pred
 
             # A threat that is no longer alive reflects nothing back to the radar, so
             # the track drops the same step truth marks it gone -- otherwise this is

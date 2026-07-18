@@ -333,6 +333,8 @@ def _oracle_params(params: EngineParams) -> EngagementParams:
         threat_model=params.physics.threat_model,
         maneuver_accel_mps2=params.physics.maneuver_accel_mps2,
         maneuver_period_s=params.physics.maneuver_period_s,
+        tracker=params.tracker,
+        imm_q_ca=params.imm_q_ca,
         salvo_size=params.salvo_size,
     )
 
@@ -639,6 +641,23 @@ def test_full_loop_salvo_parity() -> None:
 
     committed = int(engine["interceptor_committed"][-1].sum())
     assert committed > 1, "salvo never committed more than one round"
+
+
+@pytest.mark.slow
+def test_full_loop_imm_parity() -> None:
+    """IMM tracker (CV/CA bank) bookkeeping against the independent oracle."""
+    config = _raid_config(0, 2, 2)
+    params = EngineParams.from_config(config, engage=True)
+    params = replace(params, tracker="imm")
+
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=2)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 2)
+
+    deviations = _compare(engine, oracle)
+    report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
+    print(f"imm engine vs oracle: {report}")
+    for name, deviation in deviations.items():
+        assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
 
 
 @pytest.mark.slow

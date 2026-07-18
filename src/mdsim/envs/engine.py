@@ -27,13 +27,23 @@ from mdsim.engagement import doctrine, envelopes, inventory, priority
 from mdsim.engagement.assignment import UNASSIGNED
 from mdsim.guidance.launch import should_launch
 from mdsim.guidance.pro_nav import pn_accel
-from mdsim.sensing import kalman, radar
+from mdsim.sensing import imm, kalman, radar
 from mdsim.sensing.tracks import TrackState
 from mdsim.world import damage
 
 # A single position fix carries no velocity information, so the track opens with a
 # deliberately wide velocity block, in (m/s)^2.
 INITIAL_VELOCITY_VARIANCE = 1.0e6
+
+TRACKERS = ("kf", "imm")
+
+# IMM's CA process noise, relative to the run's single-KF q (kf_q, reused as the IMM
+# CV model's q so the two trackers see the same "how much do I trust straight-line
+# flight" prior). This ratio is the one sensing/imm.py's own tests validated on a
+# synthetic maneuvering target (q_cv=1.0, q_ca=2000.0) -- carried through as a ratio
+# rather than a fixed absolute so it scales with whatever kf_q a scenario uses,
+# instead of being a second, independently-tuned constant.
+IMM_Q_CA_RATIO = 2000.0
 
 
 @dataclass(frozen=True)
@@ -55,11 +65,17 @@ class EngineParams:
     engage: bool = True
     # Phase 2 additions, all defaulted to the Phase 0/1 behaviour: a caller that never
     # sets these gets byte-identical output to before these fields existed.
+    tracker: str = "kf"
+    imm_q_ca: float = 0.0
     salvo_size: int = 1
 
     def __post_init__(self) -> None:
+        if self.tracker not in TRACKERS:
+            raise ValueError(f"tracker must be one of {TRACKERS}, got {self.tracker!r}")
         if self.salvo_size < 1:
             raise ValueError(f"salvo_size must be >= 1, got {self.salvo_size}")
+        if self.tracker == "imm" and self.imm_q_ca <= 0.0:
+            raise ValueError("imm_q_ca must be positive when tracker='imm'")
 
     @classmethod
     def from_config(
@@ -87,6 +103,7 @@ class EngineParams:
             decision_interval_steps=config.sim.decision_interval_steps,
             city_impact_radius_m=config.sim.city_impact_radius_m,
             engage=engage,
+            imm_q_ca=config.sim.kf_process_noise_q * IMM_Q_CA_RATIO,
         )
 
 
@@ -102,6 +119,29 @@ def _advance_threats(state: EnvState, params: EngineParams) -> tuple[Tensor, Ten
         torch.where(alive, pos, state.threat_pos),
         torch.where(alive, vel, state.threat_vel),
     )
+
+
+def _imm_placeholder(tracks: TrackState, dtype: torch.dtype, device: torch.device) -> TrackState:
+    """Materialize inert (mu, x_models, P_models) the first time IMM runs on a state.
+
+    make_empty() (tracks.py) leaves these None regardless of which tracker a run
+    selects, so a state built before the tracker choice is known stays valid for
+    either. The first IMM step on a fresh state fills them with values every track
+    slot can safely mix from even though nothing has been detected yet: mu at the
+    prior, x_models at zero, P_models at identity (the same inert-covariance
+    convention tracks.make_empty already uses for the single-KF P). Every one of
+    these entries is overwritten by imm_initialize on that slot's first real
+    detection; the placeholder only has to survive being mixed with itself.
+    """
+    n_envs, n_tracks = tracks.detected.shape
+    mu0 = torch.tensor(imm.DEFAULT_MU0, dtype=dtype, device=device)
+    mu = mu0.expand(n_envs, n_tracks, imm.N_MODELS).clone()
+    x_models = torch.zeros(
+        (n_envs, n_tracks, imm.N_MODELS, imm.STATE_DIM), dtype=dtype, device=device
+    )
+    eye = torch.eye(imm.STATE_DIM, dtype=dtype, device=device)
+    P_models = eye.expand(n_envs, n_tracks, imm.N_MODELS, imm.STATE_DIM, imm.STATE_DIM).clone()
+    return replace(tracks, mu=mu, x_models=x_models, P_models=P_models)
 
 
 def _run_tracker(
@@ -132,29 +172,51 @@ def _run_tracker(
     gravity = torch.tensor(
         (0.0, 0.0, -params.physics.g), dtype=threat_pos.dtype, device=threat_pos.device
     )
-    x_pred, P_pred = kalman.predict(
-        tracks.x_est, tracks.P, dt, params.kf_q, known_accel=gravity
-    )
-
     R = kalman.cartesian_measurement_covariance(
         measured_sph, params.sigma_range_m, params.sigma_az_rad, params.sigma_el_rad
     )
-
     opening = detected & ~tracks.detected
-    x_init, P_init = kalman.initialize(measured_cart, R, INITIAL_VELOCITY_VARIANCE)
 
-    updating = detected & tracks.detected
-    x_upd, P_upd = kalman.update(x_pred, P_pred, measured_cart, R)
+    if params.tracker == "imm":
+        imm_prior = tracks if tracks.mu is not None else _imm_placeholder(
+            tracks, threat_pos.dtype, threat_pos.device
+        )
+        continued = imm.imm_step(
+            imm_prior, measured_cart, R, detected, dt, params.kf_q, params.imm_q_ca, gravity
+        )
+        opened = imm.imm_initialize(measured_cart, R)
 
-    open_mask = opening.unsqueeze(-1)
-    update_mask = updating.unsqueeze(-1)
-    x_new = torch.where(open_mask, x_init, torch.where(update_mask, x_upd, x_pred))
+        open_mask = opening.unsqueeze(-1)
+        open_mask_cov = open_mask.unsqueeze(-1)
+        open_mask_models = opening[..., None, None]
+        open_mask_models_cov = opening[..., None, None, None]
 
-    open_mask_cov = opening.unsqueeze(-1).unsqueeze(-1)
-    update_mask_cov = updating.unsqueeze(-1).unsqueeze(-1)
-    P_new = torch.where(
-        open_mask_cov, P_init, torch.where(update_mask_cov, P_upd, P_pred)
-    )
+        x_new = torch.where(open_mask, opened.x_est, continued.x_est)
+        P_new = torch.where(open_mask_cov, opened.P, continued.P)
+        mu_new = torch.where(open_mask, opened.mu, continued.mu)
+        x_models_new = torch.where(open_mask_models, opened.x_models, continued.x_models)
+        P_models_new = torch.where(open_mask_models_cov, opened.P_models, continued.P_models)
+    else:
+        x_pred, P_pred = kalman.predict(
+            tracks.x_est, tracks.P, dt, params.kf_q, known_accel=gravity
+        )
+        x_init, P_init = kalman.initialize(measured_cart, R, INITIAL_VELOCITY_VARIANCE)
+
+        updating = detected & tracks.detected
+        x_upd, P_upd = kalman.update(x_pred, P_pred, measured_cart, R)
+
+        open_mask = opening.unsqueeze(-1)
+        update_mask = updating.unsqueeze(-1)
+        x_new = torch.where(open_mask, x_init, torch.where(update_mask, x_upd, x_pred))
+
+        open_mask_cov = opening.unsqueeze(-1).unsqueeze(-1)
+        update_mask_cov = updating.unsqueeze(-1).unsqueeze(-1)
+        P_new = torch.where(
+            open_mask_cov, P_init, torch.where(update_mask_cov, P_upd, P_pred)
+        )
+        mu_new = None
+        x_models_new = None
+        P_models_new = None
 
     # A threat that is no longer alive -- killed, leaked, or grounded -- reflects
     # nothing back to the radar, so the track drops the same step truth marks it
@@ -168,6 +230,9 @@ def _run_tracker(
         detected=held,
         age=tracks.age + torch.where(held, dt, torch.zeros_like(tracks.age)),
         updated=detected,
+        mu=mu_new,
+        x_models=x_models_new,
+        P_models=P_models_new,
     )
 
 
