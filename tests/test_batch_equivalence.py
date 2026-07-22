@@ -335,6 +335,7 @@ def _oracle_params(params: EngineParams) -> EngagementParams:
         maneuver_period_s=params.physics.maneuver_period_s,
         tracker=params.tracker,
         imm_q_ca=params.imm_q_ca,
+        assignment_method=params.assignment_method,
         salvo_size=params.salvo_size,
     )
 
@@ -641,6 +642,51 @@ def test_full_loop_salvo_parity() -> None:
 
     committed = int(engine["interceptor_committed"][-1].sum())
     assert committed > 1, "salvo never committed more than one round"
+
+
+@pytest.mark.slow
+def test_full_loop_hungarian_parity() -> None:
+    """Hungarian assignment decisions (interceptor_target, exact) against the oracle."""
+    config = _raid_config(2, 3, 3)
+    params = EngineParams.from_config(config, engage=True)
+    params = replace(params, assignment_method="hungarian")
+
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=3)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 3)
+
+    deviations = _compare(engine, oracle)
+    report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
+    print(f"hungarian engine vs oracle: {report}")
+    for name, deviation in deviations.items():
+        assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
+
+
+@pytest.mark.slow
+def test_full_loop_combined_phase2_parity() -> None:
+    """All four Phase 2 features at once: weave + IMM + Hungarian + salvo.
+
+    The parity gate has to hold with every axis on simultaneously, not just
+    pairwise -- a bug in how two features compose would not necessarily show up
+    with only one enabled at a time.
+    """
+    config = _phase2_config(4, 2, 4, threat="iskander_m")
+    params = EngineParams.from_config(config, engage=True)
+    params = replace(
+        params,
+        physics=replace(params.physics, threat_model="weave"),
+        tracker="imm",
+        assignment_method="hungarian",
+        salvo_size=2,
+    )
+
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=4)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 4)
+
+    deviations = _compare(engine, oracle)
+    report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
+    print(f"combined phase 2 engine vs oracle: {report}")
+    for name, deviation in deviations.items():
+        assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
 
 
 @pytest.mark.slow

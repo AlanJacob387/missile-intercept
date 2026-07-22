@@ -35,6 +35,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 G = 9.80665
 
@@ -53,6 +54,17 @@ _UNIT = 2.0**-24
 STREAM_RANGE = 101
 STREAM_AZ = 102
 STREAM_EL = 103
+
+# Mirrors engagement/assignment.py's _TIE_EPS/_tie_break exactly: a genuine
+# multi-slot tie needs a non-separable perturbation to break (see
+# assignment.py's own derivation), and both solvers must break it the same way
+# or the batch-equivalence gate would compare two equally-correct answers and
+# fail on a distinction that is not a bug in either.
+_TIE_EPS = 1.0e-9
+
+
+def _tie_break(slot: int, threat_or_decline: int) -> float:
+    return _TIE_EPS * (slot + 1) * (threat_or_decline + 1)
 
 
 def _drag_accel(
@@ -224,6 +236,7 @@ class EngagementParams:
     maneuver_period_s: float = 20.0
     tracker: str = "kf"
     imm_q_ca: float = 0.0
+    assignment_method: str = "greedy"
     salvo_size: int = 1
 
 
@@ -486,6 +499,48 @@ def _imm_step_track(x_models_prev, P_models_prev, mu_prev, z, R, dt, q_cv, q_ca,
 
     x_comb, P_comb = _imm_combine(x_final, P_final, mu_new)
     return x_final, P_final, mu_new, x_comb[:6], P_comb[:6, :6]
+
+
+def _hungarian_naive(value, assignable, available):
+    """Optimal WTA via scipy.optimize.linear_sum_assignment, the deliberate
+    independent-oracle choice: assignment.hungarian is a hand-rolled solver, checked
+    against scipy directly in tests/test_hungarian.py, and this function is what
+    stands in for it here, via a different solver entirely.
+
+    value is [I, T] -- per-(slot, threat), mirroring assignment.hungarian's [N,I,T]
+    contract at one env. Every slot is interchangeable in the current single-battery
+    engine, so the caller passes every row identical (the same priority repeated for
+    each slot); the richer per-row signature exists because that is the contract
+    Hungarian's whole value proposition depends on.
+
+    Mirrors the same masking scheme independently: one dedicated free ("decline")
+    column per available slot, a large penalty on every non-assignable or
+    not-this-slot's-decline entry, so a legal one-to-one matching is what scipy
+    actually returns and masking never has to be filtered post hoc.
+    """
+    n_interceptors, n_threats = value.shape
+    target = np.full(n_interceptors, -1, dtype=np.int64)
+
+    slots = [i for i in range(n_interceptors) if available[i]]
+    n_avail = len(slots)
+    if n_avail == 0:
+        return target
+
+    large = 1e15
+    cost = np.full((n_avail, n_threats + n_avail), large, dtype=np.float64)
+    for row, slot in enumerate(slots):
+        for t in range(n_threats):
+            base = -float(value[slot, t]) if assignable[t] else large
+            cost[row, t] = base + _tie_break(slot, t)
+        for k in range(n_avail):
+            base = 0.0 if k == row else large
+            cost[row, n_threats + k] = base + _tie_break(slot, n_threats)
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    for row, col in zip(row_ind, col_ind):
+        if col < n_threats:
+            target[slots[row]] = col
+    return target
 
 
 def _predicted_intercept(track_pos, track_vel, launch_pos, speed):
@@ -855,6 +910,20 @@ def run_engagement(
         available = enabled & ~interceptor_committed
 
         if (k % p.decision_interval_steps) == 0:
+            if p.assignment_method == "hungarian":
+                # Every slot is interchangeable in this single-battery oracle, so
+                # every row is the same priority vector broadcast -- the richer
+                # per-(slot, threat) value only pays off once slots differ (a later
+                # battery-aware value matrix), and until then Hungarian ties greedy
+                # exactly, an expected result of there being no slot-threat coupling
+                # to exploit yet.
+                value = np.tile(priority, (n_interceptors, 1))
+
+                def solver(pr, asg, avail):
+                    return _hungarian_naive(value, asg, avail)
+            else:
+                solver = _greedy_naive
+
             # Salvo: up to salvo_size rounds per threat in this one decision, each
             # round competing for whatever slots the previous round left available.
             # priority/assignable are untouched between rounds -- mirrors
@@ -862,7 +931,7 @@ def run_engagement(
             proposed = np.full(n_interceptors, -1, dtype=np.int64)
             remaining = available.copy()
             for _round in range(p.salvo_size):
-                round_binding = _greedy_naive(priority, assignable, remaining)
+                round_binding = solver(priority, assignable, remaining)
                 for i in range(n_interceptors):
                     if round_binding[i] >= 0:
                         proposed[i] = round_binding[i]

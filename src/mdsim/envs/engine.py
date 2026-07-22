@@ -24,6 +24,7 @@ from mdsim.core.integrator import integrate
 from mdsim.core.state import EnvState
 from mdsim.core.threat_models import get_threat_model
 from mdsim.engagement import doctrine, envelopes, inventory, priority
+from mdsim.engagement import assignment as assignment_mod
 from mdsim.engagement.assignment import UNASSIGNED
 from mdsim.guidance.launch import should_launch
 from mdsim.guidance.pro_nav import pn_accel
@@ -36,6 +37,7 @@ from mdsim.world import damage
 INITIAL_VELOCITY_VARIANCE = 1.0e6
 
 TRACKERS = ("kf", "imm")
+ASSIGNMENT_METHODS = ("greedy", "hungarian")
 
 # IMM's CA process noise, relative to the run's single-KF q (kf_q, reused as the IMM
 # CV model's q so the two trackers see the same "how much do I trust straight-line
@@ -67,11 +69,17 @@ class EngineParams:
     # sets these gets byte-identical output to before these fields existed.
     tracker: str = "kf"
     imm_q_ca: float = 0.0
+    assignment_method: str = "greedy"
     salvo_size: int = 1
 
     def __post_init__(self) -> None:
         if self.tracker not in TRACKERS:
             raise ValueError(f"tracker must be one of {TRACKERS}, got {self.tracker!r}")
+        if self.assignment_method not in ASSIGNMENT_METHODS:
+            raise ValueError(
+                f"assignment_method must be one of {ASSIGNMENT_METHODS}, "
+                f"got {self.assignment_method!r}"
+            )
         if self.salvo_size < 1:
             raise ValueError(f"salvo_size must be >= 1, got {self.salvo_size}")
         if self.tracker == "imm" and self.imm_q_ca <= 0.0:
@@ -267,7 +275,19 @@ def _assign(
     assignable = engageable & tracks.detected & ~already_engaged
     free = inventory.available(state.interceptor_enabled, state.interceptor_committed)
 
-    proposed = doctrine.salvo(scores, assignable, free, params.salvo_size)
+    if params.assignment_method == "hungarian":
+        # Every slot is interchangeable in this single-battery engine, so the value
+        # matrix is just the priority vector broadcast to every slot -- Hungarian's
+        # richer per-(slot, threat) signature only pays off once slots differ, and
+        # until then it ties greedy exactly. See assignment.hungarian's docstring.
+        value = scores.unsqueeze(1).expand(-1, state.n_interceptors, -1)
+
+        def assign_fn(priority: Tensor, assignable_: Tensor, available_: Tensor) -> Tensor:
+            return assignment_mod.hungarian(value, assignable_, available_)
+    else:
+        assign_fn = assignment_mod.greedy
+
+    proposed = doctrine.salvo(scores, assignable, free, params.salvo_size, assign_fn=assign_fn)
     committed = inventory.commit(state.interceptor_target, proposed)
 
     decide = ((state.step_index % params.decision_interval_steps) == 0).unsqueeze(-1)
