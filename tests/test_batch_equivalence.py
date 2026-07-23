@@ -12,7 +12,7 @@ import torch
 from mdsim.core import dynamics
 from mdsim.core.config import load_config, resolve_device
 from mdsim.core.rng import _bits as torch_bits, normal
-from mdsim.core.state import EnvState, make_initial
+from mdsim.core.state import EnvState, _resolve_battery_stocks, make_initial
 from mdsim.envs.engine import INITIAL_VELOCITY_VARIANCE, EngineParams, step
 from mdsim.envs.rollout import rollout
 from mdsim.world.scenario import multi_launch_state
@@ -337,6 +337,9 @@ def _oracle_params(params: EngineParams) -> EngagementParams:
         imm_q_ca=params.imm_q_ca,
         assignment_method=params.assignment_method,
         salvo_size=params.salvo_size,
+        battery_positions=params.battery_positions,
+        battery_of_slot=params.battery_of_slot,
+        aim_dispersion_rad=params.aim_dispersion_rad,
     )
 
 
@@ -360,7 +363,7 @@ def _engine_history(
     config,
     params: EngineParams,
     n_steps: int,
-    inventory: int | None = None,
+    inventory: int | list[int] | None = None,
     step_fn=step,
 ) -> dict[str, torch.Tensor]:
     """Run the engine at N=1 in float64, recording every field the oracle returns."""
@@ -388,11 +391,33 @@ def _engine_history(
     return {key: torch.stack(values) for key, values in frames.items()}
 
 
+def _oracle_enabled(config, inventory: int | list[int]) -> list[bool]:
+    """Flat per-slot enabled mask, mirroring make_initial's inventory resolution.
+
+    Single-battery: a flat index<inventory count over the whole slot range.
+    Multi-battery: inventory resolution (the None/int/Sequence[int] contract) is
+    config resolution shared with make_initial, not part of what this file's
+    parity gate is testing -- reusing state._resolve_battery_stocks here is the
+    same kind of deliberate sharing _burnout_states already does for launch
+    geometry via mdsim.world.scenario.multi_launch_state.
+    """
+    batteries = config.scenario.batteries
+    if not batteries:
+        n_interceptors = config.scenario.n_interceptors
+        return [index < inventory for index in range(n_interceptors)]
+
+    stocks = _resolve_battery_stocks(batteries, inventory)
+    enabled: list[bool] = []
+    for spec, stock in zip(batteries, stocks):
+        enabled.extend(index < stock for index in range(spec.n_interceptors))
+    return enabled
+
+
 def _oracle_history(
     config,
     params: EngineParams,
     n_steps: int,
-    inventory: int,
+    inventory: int | list[int],
     n_active: int | None = None,
 ):
     """Run the oracle from the same resolved initial conditions the engine uses.
@@ -403,7 +428,6 @@ def _oracle_history(
     comparison would fail for a reason that has nothing to do with the engagement.
     """
     n_threats = config.scenario.n_threats
-    n_interceptors = config.scenario.n_interceptors
 
     active_count = n_threats if n_active is None else n_active
     active = max(active_count, 1)
@@ -415,7 +439,7 @@ def _oracle_history(
         velocities = list(velocities) + [velocities[-1]] * pad
         targets = list(targets) + [targets[-1]] * pad
 
-    enabled = [index < inventory for index in range(n_interceptors)]
+    enabled = _oracle_enabled(config, inventory)
 
     return run_engagement(
         _oracle_params(params),
@@ -428,7 +452,6 @@ def _oracle_history(
         [city.value for city in config.cities],
         config.sim.seed,
         n_steps,
-        battery_pos=config.scenario.battery_pos_m,
     )
 
 
@@ -625,23 +648,22 @@ def test_full_loop_weave_parity() -> None:
 
 
 @pytest.mark.slow
-def test_full_loop_salvo_parity() -> None:
-    """Salvo (size 2) inventory/assignment bookkeeping against the oracle."""
-    config = _raid_config(4, 1, 3)
+def test_full_loop_imm_parity() -> None:
+    """IMM tracker (states, per-model covariances folded into track_P) against the
+    independent oracle. Ballistic flight, so this isolates the tracker from the
+    threat-model choice."""
+    config = _raid_config(0, 2, 2)
     params = EngineParams.from_config(config, engage=True)
-    params = replace(params, salvo_size=2)
+    params = replace(params, tracker="imm")
 
-    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=3)
-    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 3)
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=2)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 2)
 
     deviations = _compare(engine, oracle)
     report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
-    print(f"salvo engine vs oracle: {report}")
+    print(f"imm engine vs oracle: {report}")
     for name, deviation in deviations.items():
         assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
-
-    committed = int(engine["interceptor_committed"][-1].sum())
-    assert committed > 1, "salvo never committed more than one round"
 
 
 @pytest.mark.slow
@@ -659,6 +681,26 @@ def test_full_loop_hungarian_parity() -> None:
     print(f"hungarian engine vs oracle: {report}")
     for name, deviation in deviations.items():
         assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
+
+
+@pytest.mark.slow
+def test_full_loop_salvo_parity() -> None:
+    """Salvo (size 2) inventory/assignment bookkeeping against the oracle."""
+    config = _raid_config(4, 1, 3)
+    params = EngineParams.from_config(config, engage=True)
+    params = replace(params, salvo_size=2)
+
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=3)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 3)
+
+    deviations = _compare(engine, oracle)
+    report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
+    print(f"salvo engine vs oracle: {report}")
+    for name, deviation in deviations.items():
+        assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
+
+    committed = int(engine["interceptor_committed"][-1].sum())
+    assert committed > 1, "salvo never committed more than one round"
 
 
 @pytest.mark.slow
@@ -689,19 +731,112 @@ def test_full_loop_combined_phase2_parity() -> None:
         assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
 
 
-@pytest.mark.slow
-def test_full_loop_imm_parity() -> None:
-    """IMM tracker (CV/CA bank) bookkeeping against the independent oracle."""
-    config = _raid_config(0, 2, 2)
-    params = EngineParams.from_config(config, engage=True)
-    params = replace(params, tracker="imm")
+def _multi_battery_config(seed: int):
+    config = load_config(CONFIG_DIR, scenario="phase2_multi_battery")
+    return replace(config, sim=replace(config.sim, n_envs=1, seed=seed))
 
-    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=2)
-    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 2)
+
+@pytest.mark.slow
+def test_full_loop_multi_battery_greedy_parity() -> None:
+    """Multiple batteries, greedy assignment, against the independent oracle.
+
+    Per-battery inventory (a list, not a scalar) exercises make_initial's
+    multi-battery inventory resolution and _oracle_enabled's mirror of it together.
+    """
+    config = _multi_battery_config(0)
+    params = EngineParams.from_config(config, engage=True)
+
+    engine = _engine_history(config, params, 5000, inventory=[2, 2, 2])
+    oracle = _oracle_history(config, params, 5000, [2, 2, 2])
 
     deviations = _compare(engine, oracle)
     report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
-    print(f"imm engine vs oracle: {report}")
+    print(f"multi-battery greedy engine vs oracle: {report}")
+    for name, deviation in deviations.items():
+        assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
+
+
+@pytest.mark.slow
+def test_full_loop_multi_battery_hungarian_parity() -> None:
+    """Multiple batteries, Hungarian assignment, against the independent oracle.
+
+    This is the parity case that actually exercises the tie-break in
+    assignment.hungarian and reference.naive_sim's _hungarian_naive: same-battery
+    slots see identical per-(slot, threat) value, so the optimum is genuinely
+    non-unique here, and only a matching deterministic tie-break makes the discrete
+    interceptor_target field comparable at all -- see assignment.py's _tie_break
+    docstring for why an additive tie-break fails this specific case.
+    """
+    config = _multi_battery_config(0)
+    params = EngineParams.from_config(config, engage=True)
+    params = replace(params, assignment_method="hungarian")
+
+    engine = _engine_history(config, params, 5000, inventory=[2, 2, 2])
+    oracle = _oracle_history(config, params, 5000, [2, 2, 2])
+
+    deviations = _compare(engine, oracle)
+    report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
+    print(f"multi-battery hungarian engine vs oracle: {report}")
+    for name, deviation in deviations.items():
+        assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
+
+
+@pytest.mark.slow
+def test_full_loop_dispersion_parity() -> None:
+    """Per-round aim dispersion (single battery), against the independent oracle."""
+    config = _raid_config(4, 1, 3)
+    params = EngineParams.from_config(config, engage=True)
+    params = replace(params, salvo_size=2, aim_dispersion_rad=0.02)
+
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=3)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, 3)
+
+    deviations = _compare(engine, oracle)
+    report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
+    print(f"dispersion engine vs oracle: {report}")
+    for name, deviation in deviations.items():
+        assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
+
+
+@pytest.mark.slow
+def test_full_loop_combined_multi_battery_dispersion_parity() -> None:
+    """Multi-battery + dispersion + salvo + Hungarian all at once.
+
+    The parity gate has to hold with every axis on simultaneously here too, the
+    same reasoning as test_full_loop_combined_phase2_parity.
+    """
+    config = _multi_battery_config(2)
+    params = EngineParams.from_config(config, engage=True)
+    params = replace(params, assignment_method="hungarian", salvo_size=2, aim_dispersion_rad=0.02)
+
+    engine = _engine_history(config, params, 5000, inventory=[3, 3, 3])
+    oracle = _oracle_history(config, params, 5000, [3, 3, 3])
+
+    deviations = _compare(engine, oracle)
+    report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
+    print(f"combined multi-battery+dispersion engine vs oracle: {report}")
+    for name, deviation in deviations.items():
+        assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
+
+
+@pytest.mark.slow
+def test_single_battery_zero_dispersion_regression() -> None:
+    """The opt-in guard: 1 battery and aim_dispersion_rad=0 must reproduce Phase 2
+    exactly. Regenerates a Phase 2 case explicitly through the new fields' defaults
+    (rather than simply omitting them) so a future default change cannot silently
+    break this guarantee without this test noticing."""
+    config = _raid_config(RAID_SEED, RAID_THREATS, RAID_INTERCEPTORS)
+    params = EngineParams.from_config(config, engage=True)
+    params = replace(params, assignment_method="greedy", salvo_size=1, aim_dispersion_rad=0.0)
+    assert params.battery_positions == (config.scenario.battery_pos_m,)
+    assert params.battery_of_slot == (0,) * config.scenario.n_interceptors
+
+    engine = _engine_history(config, params, FULL_LOOP_STEPS, inventory=RAID_INVENTORY)
+    oracle = _oracle_history(config, params, FULL_LOOP_STEPS, RAID_INVENTORY)
+
+    deviations = _compare(engine, oracle)
+    report = ", ".join(f"{k}={v:.3e}" for k, v in deviations.items())
+    print(f"single-battery zero-dispersion regression: {report}")
     for name, deviation in deviations.items():
         assert deviation < RTOL, f"{name} deviates {deviation:.3e} ({report})"
 

@@ -38,3 +38,12 @@ city_impact_radius_m: 500.0
 # entry's notes. Deliberately larger than the true process noise, which makes the
 # filter conservative -- see the lower-bound note in tests/test_kalman.py.
 kf_process_noise_q: 25.0
+
+# Per-round aim/pointing error at launch, applied to the initial heading as a small
+# 3D perturbation (radians, roughly the 1-sigma cone half-angle). Zero by default --
+# every existing scenario keeps flying the exact deterministic heading it always has.
+# A caller that wants dispersed rounds (real seeker/guidance systems do have some
+# aim-point scatter at burnout) sets this explicitly; see
+# tests/test_dispersion.py for the measured effect on single-shot Pk at a
+# representative nonzero value.
+aim_dispersion_rad: 0.0

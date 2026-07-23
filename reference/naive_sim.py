@@ -54,12 +54,20 @@ _UNIT = 2.0**-24
 STREAM_RANGE = 101
 STREAM_AZ = 102
 STREAM_EL = 103
+# Mirrors guidance/launch.py's STREAM_AIM_DISPERSION exactly -- a shared protocol
+# constant, not an independent choice, the same way the three streams above are.
+STREAM_AIM_DISPERSION = 301
+
+# Mirrors envs/engine.py's UNREACHABLE_VALUE exactly, for the same reason.
+UNREACHABLE_VALUE = -1.0e9
 
 # Mirrors engagement/assignment.py's _TIE_EPS/_tie_break exactly: a genuine
-# multi-slot tie needs a non-separable perturbation to break (see
-# assignment.py's own derivation), and both solvers must break it the same way
-# or the batch-equivalence gate would compare two equally-correct answers and
-# fail on a distinction that is not a bug in either.
+# multi-battery scenario has real ties (same-battery slots see identical value for a
+# given threat), and Kuhn-Munkres vs scipy are not guaranteed to resolve a tie the
+# same way. The product form (not slot+threat) is required -- an additive
+# perturbation is invariant under swapping which of two tied slots takes which of two
+# tied threats, so it fails to break exactly the tie that matters here; see
+# assignment.py's _tie_break docstring for the derivation.
 _TIE_EPS = 1.0e-9
 
 
@@ -238,6 +246,13 @@ class EngagementParams:
     imm_q_ca: float = 0.0
     assignment_method: str = "greedy"
     salvo_size: int = 1
+    # Multi-battery layout. One entry means single-battery: every interceptor slot
+    # maps to battery 0. battery_of_slot=() is resolved in run_engagement to "every
+    # slot is battery 0" once n_interceptors is known (a frozen dataclass default
+    # cannot depend on a value supplied elsewhere).
+    battery_positions: tuple[tuple[float, float, float], ...] = ((0.0, 0.0, 0.0),)
+    battery_of_slot: tuple[int, ...] = ()
+    aim_dispersion_rad: float = 0.0
 
 
 def _to_spherical(rel: np.ndarray) -> np.ndarray:
@@ -508,10 +523,10 @@ def _hungarian_naive(value, assignable, available):
     stands in for it here, via a different solver entirely.
 
     value is [I, T] -- per-(slot, threat), mirroring assignment.hungarian's [N,I,T]
-    contract at one env. Every slot is interchangeable in the current single-battery
-    engine, so the caller passes every row identical (the same priority repeated for
-    each slot); the richer per-row signature exists because that is the contract
-    Hungarian's whole value proposition depends on.
+    contract at one env, not a single [T] priority broadcast to every row. A
+    single-battery caller passes every row identical (the same priority repeated for
+    each slot), which is what this function did implicitly before batteries existed;
+    a multi-battery caller varies rows by which battery that slot belongs to.
 
     Mirrors the same masking scheme independently: one dedicated free ("decline")
     column per available slot, a large penalty on every non-assignable or
@@ -728,7 +743,6 @@ def run_engagement(
     city_value: np.ndarray | list,
     seed: int,
     n_steps: int,
-    battery_pos: np.ndarray | list[float] | None = None,
 ) -> dict[str, np.ndarray]:
     """Run the full engagement loop for one environment with T threats and I rounds.
 
@@ -759,13 +773,15 @@ def run_engagement(
     n_interceptors = enabled.shape[0]
 
     radar_pos = np.asarray(p.radar_pos, dtype=np.float64)
-    launch_origin = (
-        radar_pos.copy()
-        if battery_pos is None
-        else np.asarray(battery_pos, dtype=np.float64)
-    )
+    battery_positions = [np.asarray(pos, dtype=np.float64) for pos in p.battery_positions]
+    battery_of_slot = list(p.battery_of_slot) if p.battery_of_slot else [0] * n_interceptors
+    if len(battery_of_slot) != n_interceptors:
+        raise ValueError(
+            f"battery_of_slot length ({len(battery_of_slot)}) must match "
+            f"n_interceptors ({n_interceptors})"
+        )
 
-    interceptor_pos = np.tile(launch_origin, (n_interceptors, 1))
+    interceptor_pos = np.stack([battery_positions[battery_of_slot[i]] for i in range(n_interceptors)])
     interceptor_vel = np.zeros((n_interceptors, 3), dtype=np.float64)
 
     # An inactive slot is never alive, so it never flies, is never tracked and is
@@ -898,10 +914,21 @@ def run_engagement(
 
         # 4. Assignment, on the decision cadence and from the tracks only. Existing
         # bindings are untouched; a committed round is never re-aimed.
-        engageable = np.array(
-            [_in_envelope(track_x[t, :3], radar_pos, p) for t in range(n_threats)],
+        #
+        # engageable_per_battery[b][t]: threat t is reachable from battery b's own
+        # position, independently for each battery -- radar_pos plays no part here,
+        # it is the detection site, not a launch site. engageable is "some battery
+        # can reach it", the single-battery-equivalent signal priority reads; with
+        # one battery this is exactly the old radar_pos-based check.
+        engageable_per_battery = np.array(
+            [
+                [_in_envelope(track_x[t, :3], battery_positions[b], p) for t in range(n_threats)]
+                for b in range(len(battery_positions))
+            ],
             dtype=bool,
         )
+        engageable = engageable_per_battery.any(axis=0)
+
         priority = _threat_priority(
             track_x, track_detected, engageable, cities, values, city_alive, p.g
         )
@@ -911,13 +938,15 @@ def run_engagement(
 
         if (k % p.decision_interval_steps) == 0:
             if p.assignment_method == "hungarian":
-                # Every slot is interchangeable in this single-battery oracle, so
-                # every row is the same priority vector broadcast -- the richer
-                # per-(slot, threat) value only pays off once slots differ (a later
-                # battery-aware value matrix), and until then Hungarian ties greedy
-                # exactly, an expected result of there being no slot-threat coupling
-                # to exploit yet.
+                # Per-(slot, threat) value: each slot inherits its OWN battery's
+                # reachability, not "some battery's". A pairing engageable allows but
+                # this slot's own battery cannot reach gets UNREACHABLE_VALUE.
                 value = np.tile(priority, (n_interceptors, 1))
+                for i in range(n_interceptors):
+                    b = battery_of_slot[i]
+                    for t in range(n_threats):
+                        if not engageable_per_battery[b, t]:
+                            value[i, t] = UNREACHABLE_VALUE
 
                 def solver(pr, asg, avail):
                     return _hungarian_naive(value, asg, avail)
@@ -942,6 +971,21 @@ def run_engagement(
 
         # 5. Launch. A slot may only fly at the threat it is bound to, and only if it
         # holds an unfired round.
+        #
+        # Dispersion noise is drawn once per step for every slot regardless of
+        # whether that slot launches -- it is a pure function of (seed, step, slot),
+        # so drawing it unconditionally or only when needed gives the identical
+        # value either way; only computing it when aim_dispersion_rad > 0 just
+        # skips the work when it can never be used. Reshape order matches the
+        # engine's normal(..., shape=(n_interceptors, 3)) exactly: both flatten in
+        # C order, lane L -> (slot L // 3, axis L % 3).
+        if p.aim_dispersion_rad > 0.0:
+            dispersion = _normal(seeds, k, STREAM_AIM_DISPERSION, n_interceptors * 3)[0].reshape(
+                n_interceptors, 3
+            )
+        else:
+            dispersion = None
+
         for i in range(n_interceptors):
             bound = int(interceptor_target[i])
             blocked = (
@@ -964,6 +1008,9 @@ def run_engagement(
             if launch:
                 heading = point - interceptor_pos[i]
                 heading = heading / max(float(np.linalg.norm(heading)), 1e-9)
+                if dispersion is not None:
+                    heading = heading + dispersion[i] * p.aim_dispersion_rad
+                    heading = heading / max(float(np.linalg.norm(heading)), 1e-9)
                 interceptor_vel[i] = heading * p.interceptor_speed_mps
                 interceptor_alive[i] = True
                 interceptor_committed[i] = True

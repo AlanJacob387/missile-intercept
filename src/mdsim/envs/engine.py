@@ -47,6 +47,14 @@ ASSIGNMENT_METHODS = ("greedy", "hungarian")
 # instead of being a second, independently-tuned constant.
 IMM_Q_CA_RATIO = 2000.0
 
+# Cost assigned to a (slot, threat) pair where the threat is engageable by SOME
+# battery but not by this slot's OWN battery. Deeply negative so Hungarian's cost
+# (-value) is deeply positive, well above the decline column's cost of 0 but below
+# assignment.hungarian's own _LARGE_COST=1e12 for a truly non-assignable threat --
+# an unreachable pairing is worse than any real one but never the worst option on
+# the board, since a slot can always fall back on its own decline column instead.
+UNREACHABLE_VALUE = -1.0e9
+
 
 @dataclass(frozen=True)
 class EngineParams:
@@ -71,6 +79,14 @@ class EngineParams:
     imm_q_ca: float = 0.0
     assignment_method: str = "greedy"
     salvo_size: int = 1
+    # Multi-battery layout. One entry means single-battery: every slot maps to
+    # battery 0, which is battery_positions[0] -- for a scenario with no
+    # scenario.batteries, from_config sets this to (battery_pos_m,), so the general
+    # multi-battery computation in _assign reduces to exactly the old single-radar_pos
+    # arithmetic rather than needing a separate code path.
+    battery_positions: tuple[tuple[float, float, float], ...] = ((0.0, 0.0, 0.0),)
+    battery_of_slot: tuple[int, ...] = (0,)
+    aim_dispersion_rad: float = 0.0
 
     def __post_init__(self) -> None:
         if self.tracker not in TRACKERS:
@@ -84,6 +100,15 @@ class EngineParams:
             raise ValueError(f"salvo_size must be >= 1, got {self.salvo_size}")
         if self.tracker == "imm" and self.imm_q_ca <= 0.0:
             raise ValueError("imm_q_ca must be positive when tracker='imm'")
+        if not self.battery_positions:
+            raise ValueError("battery_positions must have at least one entry")
+        n_batteries = len(self.battery_positions)
+        if any(not 0 <= b < n_batteries for b in self.battery_of_slot):
+            raise ValueError(
+                f"battery_of_slot entries must be in [0, {n_batteries}), got {self.battery_of_slot}"
+            )
+        if self.aim_dispersion_rad < 0.0:
+            raise ValueError(f"aim_dispersion_rad must be >= 0, got {self.aim_dispersion_rad}")
 
     @classmethod
     def from_config(
@@ -96,6 +121,18 @@ class EngineParams:
 
         period = max(1, round(1.0 / (radar_cfg.update_hz * dt)))
         deg = torch.pi / 180.0
+
+        scenario = config.scenario
+        if scenario.batteries:
+            battery_positions = tuple(b.position_m for b in scenario.batteries)
+            battery_of_slot = tuple(
+                b_index
+                for b_index, b in enumerate(scenario.batteries)
+                for _ in range(b.n_interceptors)
+            )
+        else:
+            battery_positions = (scenario.battery_pos_m,)
+            battery_of_slot = (0,) * scenario.n_interceptors
 
         return cls(
             physics=PhysicsParams.from_config(config),
@@ -112,6 +149,9 @@ class EngineParams:
             city_impact_radius_m=config.sim.city_impact_radius_m,
             engage=engage,
             imm_q_ca=config.sim.kf_process_noise_q * IMM_Q_CA_RATIO,
+            battery_positions=battery_positions,
+            battery_of_slot=battery_of_slot,
+            aim_dispersion_rad=config.sim.aim_dispersion_rad,
         )
 
 
@@ -256,31 +296,57 @@ def _assign(
 
     Reads TrackState and own-side tensors only. The threatened city is inferred from
     the track's extrapolated impact point, never from the threat's true target.
+
+    radar_pos is the radar's own fixed position (detection geometry only); battery
+    positions -- where interceptors actually launch from and what their envelopes are
+    measured against -- come from params.battery_positions/battery_of_slot, which may
+    differ from radar_pos and from each other.
     """
-    engageable = envelopes.in_envelope(
-        tracks.position, radar_pos, params.interceptor
+    dtype, device = tracks.position.dtype, tracks.position.device
+    battery_pos = torch.tensor(params.battery_positions, dtype=dtype, device=device)
+    battery_of_slot = torch.tensor(params.battery_of_slot, dtype=torch.int64, device=device)
+
+    # Per-battery engageability, [N, B, T]: each battery has its own envelope, so a
+    # threat can be reachable from one and not another.
+    engageable_per_battery = torch.stack(
+        [
+            envelopes.in_envelope(tracks.position, battery_pos[b], params.interceptor)
+            for b in range(battery_pos.shape[0])
+        ],
+        dim=1,
     )
+    # "Some battery can reach it" -- the single-battery-equivalent signal priority and
+    # greedy read, generalising the old single-radar_pos engageable check exactly:
+    # with one battery this reduces to that check verbatim.
+    engageable_any = engageable_per_battery.any(dim=1)
+
     scores, _ = priority.threat_priority(
         tracks,
         state.city_pos,
         state.city_value,
         state.city_alive,
-        engageable,
+        engageable_any,
         params.physics.g,
     )
 
     already_engaged = inventory.engaged_threats(
         state.interceptor_target, state.n_threats, params.salvo_size
     )
-    assignable = engageable & tracks.detected & ~already_engaged
+    assignable = engageable_any & tracks.detected & ~already_engaged
     free = inventory.available(state.interceptor_enabled, state.interceptor_committed)
 
     if params.assignment_method == "hungarian":
-        # Every slot is interchangeable in this single-battery engine, so the value
-        # matrix is just the priority vector broadcast to every slot -- Hungarian's
-        # richer per-(slot, threat) signature only pays off once slots differ, and
-        # until then it ties greedy exactly. See assignment.hungarian's docstring.
-        value = scores.unsqueeze(1).expand(-1, state.n_interceptors, -1)
+        # Per-(slot, threat) value: each slot inherits its OWN battery's engageability,
+        # not just "some battery's". A pairing engageable_any allows but this slot's
+        # battery cannot reach gets UNREACHABLE_VALUE, so Hungarian only ever takes it
+        # if every other option -- including declining -- is worse, which never
+        # happens given a free decline column always exists. With one battery every
+        # slot shares the same reachability and this reduces to the old broadcast
+        # exactly, which is why single-battery scenarios still tie greedy: see
+        # assignment.hungarian's docstring for why that tie is expected there.
+        reachable_per_slot = engageable_per_battery[:, battery_of_slot, :]
+        broadcast = scores.unsqueeze(1).expand(-1, state.n_interceptors, -1)
+        value = torch.where(reachable_per_slot, broadcast, torch.full_like(broadcast, UNREACHABLE_VALUE))
 
         def assign_fn(priority: Tensor, assignable_: Tensor, available_: Tensor) -> Tensor:
             return assignment_mod.hungarian(value, assignable_, available_)
@@ -336,6 +402,9 @@ def step(state: EnvState, params: EngineParams) -> EnvState:
         params.interceptor.envelope_min_m,
         params.interceptor.envelope_max_m,
         assignment,
+        seed=state.seed,
+        step_index=state.step_index,
+        aim_dispersion_rad=params.aim_dispersion_rad,
     )
     launch_mask = launch.unsqueeze(-1)
     interceptor_vel = torch.where(launch_mask, launch_vel, state.interceptor_vel)

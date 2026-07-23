@@ -73,6 +73,7 @@ class SimConfig:
     kf_process_noise_q: float
     decision_interval_steps: int
     city_impact_radius_m: float
+    aim_dispersion_rad: float
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,19 @@ class CityAsset:
 
 
 @dataclass(frozen=True)
+class BatterySpec:
+    """One interceptor battery: a launch site and the slot count it owns.
+
+    Slots partition the scenario's flat n_interceptors range in declaration order:
+    battery 0 owns [0, n_interceptors_0), battery 1 owns the next block, and so on.
+    """
+
+    name: str
+    position_m: tuple[float, float, float]
+    n_interceptors: int
+
+
+@dataclass(frozen=True)
 class ScenarioConfig:
     name: str
     n_threats: int
@@ -154,6 +168,12 @@ class ScenarioConfig:
     engagement_range_km: float
     launch_elevation_deg: float
     battery_pos_m: tuple[float, float, float]
+    # Optional multi-battery layout. Empty means single-battery: every interceptor
+    # slot launches from battery_pos_m, exactly the Phase 0-2 behaviour. Non-empty
+    # overrides battery_pos_m for placement purposes; battery_pos_m stays populated
+    # either way so a caller that has not been updated for multi-battery still gets
+    # a sensible single point (the first battery's position, or the legacy value).
+    batteries: tuple[BatterySpec, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -286,6 +306,7 @@ def parse_sim(data: Mapping[str, Any]) -> SimConfig:
         "kf_process_noise_q",
         "decision_interval_steps",
         "city_impact_radius_m",
+        "aim_dispersion_rad",
     )
     _require(data, fields, "sim")
     dt = _positive(data["dt"], "dt", "sim")
@@ -321,6 +342,9 @@ def parse_sim(data: Mapping[str, Any]) -> SimConfig:
         ),
         city_impact_radius_m=_positive(
             data["city_impact_radius_m"], "city_impact_radius_m", "sim"
+        ),
+        aim_dispersion_rad=_non_negative(
+            data["aim_dispersion_rad"], "aim_dispersion_rad", "sim"
         ),
     )
 
@@ -457,6 +481,19 @@ def parse_city(index: int, data: Mapping[str, Any]) -> CityAsset:
     )
 
 
+def parse_battery(index: int, data: Mapping[str, Any], scenario_where: str) -> BatterySpec:
+    where = f"{scenario_where} battery[{index}]"
+    _require(data, ("name", "position_m", "n_interceptors"), where)
+    name = data["name"]
+    if not isinstance(name, str) or not name:
+        raise ConfigError(f"{where}: name must be a non-empty string")
+    return BatterySpec(
+        name=name,
+        position_m=_vec3(data["position_m"], "position_m", where),
+        n_interceptors=_positive_int(data["n_interceptors"], "n_interceptors", where),
+    )
+
+
 def parse_scenario(
     data: Mapping[str, Any],
     threats: Mapping[str, ThreatSpec],
@@ -502,6 +539,23 @@ def parse_scenario(
             f"got {elevation!r}"
         )
 
+    # Optional: absent means single-battery, the Phase 0-2 behaviour, and no yaml
+    # written before multi-battery existed needs to change to keep loading.
+    raw_batteries = data.get("batteries", [])
+    if not isinstance(raw_batteries, list):
+        raise ConfigError(f"{where}: batteries must be a list")
+    batteries = tuple(parse_battery(i, b, where) for i, b in enumerate(raw_batteries))
+    if batteries:
+        total = sum(b.n_interceptors for b in batteries)
+        if total != data["n_interceptors"]:
+            raise ConfigError(
+                f"{where}: n_interceptors ({data['n_interceptors']}) must equal the sum "
+                f"of batteries' n_interceptors ({total})"
+            )
+        names = [b.name for b in batteries]
+        if len(set(names)) != len(names):
+            raise ConfigError(f"{where}: battery names must be unique, got {names}")
+
     return ScenarioConfig(
         name=data["name"],
         n_threats=data["n_threats"],
@@ -511,6 +565,7 @@ def parse_scenario(
         engagement_range_km=engagement_range_km,
         launch_elevation_deg=float(elevation),
         battery_pos_m=_vec3(data["battery_pos_m"], "battery_pos_m", where),
+        batteries=batteries,
     )
 
 

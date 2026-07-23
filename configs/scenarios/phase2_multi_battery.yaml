@@ -1,0 +1,36 @@
+# Phase 2: three interceptor batteries around the defended area (cities.json has two
+# assets, Asset Alpha at the origin and Asset Bravo at [25000, 12000, 0]), instead of
+# the single co-located battery every earlier scenario uses.
+#
+# Placed in a wide triangle around the midpoint between the two cities so no single
+# battery's engagement envelope (pac3_mse: 3-70 km slant range) covers the whole
+# defended area or the whole bearing spread a raid arrives across -- some threats are
+# reachable from one battery and not another, which is the geometry
+# assignment.hungarian needs to have anything to optimize over. n_interceptors is the
+# sum of the three batteries' slot counts, checked at load time.
+
+name: phase2_multi_battery
+
+n_threats: 8
+n_interceptors: 12
+
+threat: scud_b
+interceptor: pac3_mse
+
+engagement_range_km: 150.0
+launch_elevation_deg: 45.0
+
+# Legacy single-point field, unused when batteries is set below; kept populated so
+# code that has not been updated for multi-battery still gets a sensible point.
+battery_pos_m: [12500.0, 6000.0, 0.0]
+
+batteries:
+  - name: battery_north
+    position_m: [12500.0, 36000.0, 0.0]
+    n_interceptors: 4
+  - name: battery_southwest
+    position_m: [-17500.0, -9000.0, 0.0]
+    n_interceptors: 4
+  - name: battery_southeast
+    position_m: [42500.0, -9000.0, 0.0]
+    n_interceptors: 4

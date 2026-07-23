@@ -73,3 +73,25 @@ def engaged_threats(
     )
     counts.scatter_add_(1, index, torch.ones_like(index, dtype=torch.int64))
     return counts[:, :n_threats] >= salvo_size
+
+
+def remaining_by_battery(
+    interceptor_enabled: Tensor, interceptor_committed: Tensor, battery_of_slot: Tensor, n_batteries: int
+) -> Tensor:
+    """Unfired rounds remaining per battery, [N, B].
+
+    battery_of_slot is a static [I] int64 tensor mapping each interceptor slot to
+    its battery index -- built by the caller from config (not this file's concern;
+    inventory.py stays config-agnostic, plain tensors only, matching every other
+    function here). scatter_add_ into a [N, B] buffer, the same accumulation
+    pattern engagement.inventory.engaged_threats already uses for its own count.
+    """
+    n_envs = interceptor_enabled.shape[0]
+    unfired = available(interceptor_enabled, interceptor_committed).to(torch.int64)
+    index = battery_of_slot.unsqueeze(0).expand(n_envs, -1)
+
+    counts = torch.zeros(
+        (n_envs, n_batteries), dtype=torch.int64, device=interceptor_enabled.device
+    )
+    counts.scatter_add_(1, index, unfired)
+    return counts
