@@ -5,7 +5,7 @@ noise, Kalman tracking, proportional-navigation guidance, and weapon-target assi
 across thousands of parallel environments. Built as a student research project on
 public, approximate data.
 
-[![tests](https://github.com/AlanJacob387/missile-intercept/actions/workflows/tests.yml/badge.svg)](https://github.com/AlanJacob387/missile-intercept/actions/workflows/tests.yml)
+[![tests](https://github.com/AlanJacob387/vectorized-interception-engine/actions/workflows/tests.yml/badge.svg)](https://github.com/AlanJacob387/vectorized-interception-engine/actions/workflows/tests.yml)
 
 ## Verification
 
